@@ -147,14 +147,9 @@ impl Server {
             .acting_as(Actor::person(person.id, Via::WebDav))
     }
 
+    /// The person's Notes place, beside their My Drive.
     async fn notes_folder(&self, person: &Person) -> ItemId {
-        let top = self.storage.top_folder(person.id).await.unwrap();
-        self.storage
-            .find(top, vec!["Notes".into()])
-            .await
-            .unwrap()
-            .expect("a Notes folder")
-            .id
+        self.storage.place_folder(person.id, "notes").await.unwrap()
     }
 
     async fn file_text(&self, id: &str) -> String {
@@ -388,25 +383,147 @@ async fn follows_changes_made_outside_notes() {
     storage.move_item(inside.id, folder, "Work").await.unwrap();
     assert_eq!(titles(server.list(&server.alex).await), ["Meeting"]);
 
-    // Deleting the Notes folder makes a new, empty one.
-    storage.delete(folder).await.unwrap();
-    assert!(server.list(&server.alex).await.is_empty());
-    assert_ne!(server.notes_folder(&server.alex).await, folder);
+    // The Notes place itself can't be deleted.
+    assert!(matches!(
+        storage.delete(folder).await,
+        Err(accordion_core::storage::Error::TopFolder)
+    ));
 }
 
 #[tokio::test]
-async fn takes_a_notes_folder_that_is_already_there() {
+async fn leaves_a_notes_folder_in_my_drive_alone() {
     let server = start().await;
     let top = server.storage.top_folder(server.alex.id).await.unwrap();
     let storage = server.as_person(&server.alex);
     let folder = storage.create_folder(top, "Notes").await.unwrap();
-    storage
+    let ideas = storage
         .create_file(folder.id, "Ideas.md", &b"Paint the shed"[..])
+        .await
+        .unwrap();
+    assert!(server.list(&server.alex).await.is_empty());
+    assert_ne!(server.notes_folder(&server.alex).await, folder.id);
+
+    // Moving it into the Notes place makes it a note.
+    let place = server.notes_folder(&server.alex).await;
+    storage
+        .move_item(ideas.id, place, "Ideas.md")
         .await
         .unwrap();
     let notes = server.list(&server.alex).await;
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0]["title"], "Ideas");
+    assert_eq!(notes[0]["folder"], Value::Null);
+}
+
+/// The notes' titles, sorted.
+fn sorted_titles(notes: Vec<Value>) -> Vec<String> {
+    let mut titles: Vec<String> = notes
+        .iter()
+        .map(|note| note["title"].as_str().unwrap().to_owned())
+        .collect();
+    titles.sort();
+    titles
+}
+
+#[tokio::test]
+async fn shows_folders_and_the_notes_in_each() {
+    let server = start().await;
+    let place = server.notes_folder(&server.alex).await;
+    let storage = server.as_person(&server.alex);
+    let recipes = storage.create_folder(place, "Recipes").await.unwrap();
+    let soups = storage.create_folder(recipes.id, "Soups").await.unwrap();
+    let work = storage.create_folder(place, "Work").await.unwrap();
+    storage
+        .create_file(soups.id, "Leek.md", &b"Leeks"[..])
+        .await
+        .unwrap();
+    storage
+        .create_file(work.id, "Agenda.md", &b"Agenda"[..])
+        .await
+        .unwrap();
+    storage
+        .create_file(place, "Loose.md", &b"Loose"[..])
+        .await
+        .unwrap();
+
+    let (status, all) = server.api(&server.alex, "GET", "/notes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(all["notes"].as_array().unwrap().len(), 3);
+    assert_eq!(all["top"], place.to_string());
+    let folders = all["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 3);
+    let soups_view = folders
+        .iter()
+        .find(|folder| folder["name"] == "Soups")
+        .unwrap();
+    assert_eq!(soups_view["parent"], recipes.id.to_string());
+    let recipes_view = folders
+        .iter()
+        .find(|folder| folder["name"] == "Recipes")
+        .unwrap();
+    assert_eq!(recipes_view["parent"], Value::Null);
+
+    // A folder shows the notes in it and in the folders inside it.
+    let in_folder = |folder: ItemId| {
+        let server = &server;
+        async move {
+            let (status, body) = server
+                .api(
+                    &server.alex,
+                    "GET",
+                    &format!("/notes?folder={folder}"),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            sorted_titles(body["notes"].as_array().unwrap().clone())
+        }
+    };
+    assert_eq!(in_folder(recipes.id).await, ["Leek"]);
+    assert_eq!(in_folder(work.id).await, ["Agenda"]);
+
+    // A note taken in a folder is saved there.
+    let (status, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"body": "Minestrone", "folder": soups.id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{note}");
+    assert_eq!(note["folder"], soups.id.to_string());
+    let id: ItemId = note["id"].as_str().unwrap().parse().unwrap();
+    let item = server.storage.item(id).await.unwrap().unwrap();
+    assert_eq!(item.parent, Some(soups.id));
+    assert_eq!(in_folder(recipes.id).await.len(), 2);
+
+    // A note moved to another folder in Drive follows.
+    storage.move_item(id, work.id, &item.name).await.unwrap();
+    assert_eq!(in_folder(recipes.id).await, ["Leek"]);
+    assert_eq!(in_folder(work.id).await.len(), 2);
+
+    // Folders outside the Notes place aren't Notes' to show or fill.
+    let top = server.storage.top_folder(server.alex.id).await.unwrap();
+    let elsewhere = storage.create_folder(top, "Elsewhere").await.unwrap();
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "GET",
+            &format!("/notes?folder={}", elsewhere.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"body": "Stray", "folder": elsewhere.id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

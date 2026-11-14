@@ -1,6 +1,8 @@
-//! Each person's Notes folder, and the index of their notes (decision 31).
+//! Each person's Notes place, and the index of their notes (decisions 31
+//! and 32).
 //!
-//! The notes are files in the person's Drive, and the files are the truth.
+//! The notes are files in the person's Notes place, beside their My Drive,
+//! and the files are the truth.
 //! The index keeps what the list of notes shows, read from each file, so
 //! listing thousands of notes on a Raspberry Pi doesn't read thousands of
 //! files. It follows the person's changes the way a synced device does,
@@ -15,7 +17,7 @@ use std::sync::Arc;
 
 use accordion_core::db::rusqlite::{self, OptionalExtension, Row};
 use accordion_core::db::{Database, Migration};
-use accordion_core::storage::{Error, Item, ItemKind, Storage, SyncChange};
+use accordion_core::storage::{AppPlace, Error, Item, ItemKind, Storage, SyncChange};
 use accordion_types::{ItemId, UserId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
@@ -61,8 +63,27 @@ pub(crate) const MIGRATION: Migration = Migration {
     ",
 };
 
-/// The folder's name the first time.
-const FOLDER_NAME: &str = "Notes";
+pub(crate) const MIGRATION_2: Migration = Migration {
+    version: 2,
+    name: "Keep notes in a place of their own, and know each note's folder",
+    sql: "
+    -- The folder each note is in, or null at the top of the Notes place.
+    ALTER TABLE notes_index ADD COLUMN folder_id BLOB
+        CHECK (folder_id IS NULL OR length(folder_id) = 16);
+    -- Notes moved from a folder in My Drive to a place of their own
+    -- (decision 32), so each index is made again from there. What was in
+    -- the old folder stays in My Drive.
+    DELETE FROM notes_index;
+    DELETE FROM notes_folders;
+    ",
+};
+
+/// Notes' place beside My Drive.
+pub(crate) const PLACE: AppPlace = AppPlace {
+    id: "notes",
+    name: "Notes",
+};
+
 /// How much of a file is read for the index. Longer notes are searched by
 /// their start only.
 const READ_LIMIT: u64 = 1024 * 1024;
@@ -75,6 +96,8 @@ pub(crate) struct Indexed {
     pub id: ItemId,
     pub hash: String,
     pub name: String,
+    /// The folder it's in, which may be the top of the Notes place.
+    pub folder: Option<ItemId>,
     pub details: note::Details,
     pub body: String,
     pub created_at: String,
@@ -99,37 +122,24 @@ impl Store {
         }
     }
 
-    /// `user`'s Notes folder, made or found the first time they need it. A
-    /// folder named Notes at the top of My Drive is taken as it is, so
-    /// someone who already keeps notes there finds them.
-    pub(crate) async fn folder(&self, user: UserId, storage: &Storage) -> Result<ItemId, Error> {
-        if let Some(folder) = self.saved_folder(user).await?
-            && self.usable_folder(user, folder).await?
-        {
-            return Ok(folder);
+    /// `user`'s Notes place, made the first time they need it.
+    pub(crate) async fn folder(&self, user: UserId) -> Result<ItemId, Error> {
+        let top = self.storage.place_folder(user, PLACE.id).await?;
+        if self.saved_folder(user).await? != Some(top) {
+            self.db
+                .write(move |tx| {
+                    tx.execute(
+                        "INSERT INTO notes_folders (user_id, folder_id, cursor)
+                         VALUES (?1, ?2, NULL)
+                         ON CONFLICT (user_id) DO UPDATE SET
+                             folder_id = excluded.folder_id, cursor = NULL",
+                        (user.as_uuid(), top.as_uuid()),
+                    )?;
+                    Ok::<_, Error>(())
+                })
+                .await?;
         }
-        let top = self.storage.top_folder(user).await?;
-        let found = self
-            .storage
-            .find(top, vec![FOLDER_NAME.to_owned()])
-            .await?
-            .filter(|item| item.kind == ItemKind::Folder && item.trashed_at.is_none());
-        let folder = match found {
-            Some(item) => item.id,
-            None => make_folder(storage, top).await?.id,
-        };
-        self.db
-            .write(move |tx| {
-                tx.execute(
-                    "INSERT INTO notes_folders (user_id, folder_id, cursor) VALUES (?1, ?2, NULL)
-                     ON CONFLICT (user_id) DO UPDATE SET
-                         folder_id = excluded.folder_id, cursor = NULL",
-                    (user.as_uuid(), folder.as_uuid()),
-                )?;
-                Ok::<_, Error>(())
-            })
-            .await?;
-        Ok(folder)
+        Ok(top)
     }
 
     async fn saved_folder(&self, user: UserId) -> Result<Option<ItemId>, Error> {
@@ -146,16 +156,20 @@ impl Store {
             .await
     }
 
-    /// Whether the folder is still `user`'s, and outside the trash.
-    async fn usable_folder(&self, user: UserId, folder: ItemId) -> Result<bool, Error> {
-        let Some(item) = self.storage.item(folder).await? else {
-            return Ok(false);
-        };
-        if item.owner != user || item.kind != ItemKind::Folder {
-            return Ok(false);
+    /// Every folder inside `top`, however deep, outside the trash, each
+    /// with the folder it's in, sorted by name within each folder.
+    pub(crate) async fn folders(&self, top: ItemId) -> Result<Vec<Item>, Error> {
+        let mut found = Vec::new();
+        let mut waiting = vec![top];
+        while let Some(folder) = waiting.pop() {
+            for child in self.storage.children(folder).await? {
+                if child.kind == ItemKind::Folder {
+                    waiting.push(child.id);
+                    found.push(child);
+                }
+            }
         }
-        let top = self.storage.top_folder(user).await?;
-        Ok(self.storage.path_within(top, folder).await?.is_some())
+        Ok(found)
     }
 
     /// Whether `id` is one of `user`'s notes: their file, inside their
@@ -330,6 +344,7 @@ impl Store {
             id,
             hash,
             name: item.name.clone(),
+            folder: item.parent,
             details,
             body,
             created_at: item.created_at.clone(),
@@ -340,14 +355,15 @@ impl Store {
             .write(move |tx| {
                 tx.execute(
                     "INSERT INTO notes_index (item_id, user_id, hash, name, color, pinned,
-                         archived, tags, body, created_at, modified_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                         archived, tags, body, created_at, modified_at, folder_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT (item_id) DO UPDATE SET
                          user_id = excluded.user_id, hash = excluded.hash,
                          name = excluded.name, color = excluded.color,
                          pinned = excluded.pinned, archived = excluded.archived,
                          tags = excluded.tags, body = excluded.body,
-                         created_at = excluded.created_at, modified_at = excluded.modified_at",
+                         created_at = excluded.created_at, modified_at = excluded.modified_at,
+                         folder_id = excluded.folder_id",
                     rusqlite::params![
                         row.id.as_uuid(),
                         user.as_uuid(),
@@ -360,6 +376,7 @@ impl Store {
                         row.body,
                         row.created_at,
                         row.modified_at,
+                        row.folder.map(|folder| folder.as_uuid()),
                     ],
                 )?;
                 Ok::<_, Error>(())
@@ -484,7 +501,7 @@ impl Store {
 }
 
 const SELECT: &str = "SELECT item_id, hash, name, color, pinned, archived, tags, body,
-    created_at, modified_at FROM notes_index";
+    created_at, modified_at, folder_id FROM notes_index";
 
 fn indexed_from_row(row: &Row<'_>) -> rusqlite::Result<Indexed> {
     let tags: String = row.get(6)?;
@@ -501,22 +518,8 @@ fn indexed_from_row(row: &Row<'_>) -> rusqlite::Result<Indexed> {
         body: row.get(7)?,
         created_at: row.get(8)?,
         modified_at: row.get(9)?,
+        folder: row.get::<_, Option<_>>(10)?.map(ItemId::from_uuid),
     })
-}
-
-/// Makes the Notes folder, with a number if a file is called Notes.
-async fn make_folder(storage: &Storage, top: ItemId) -> Result<Item, Error> {
-    let mut number = 1;
-    loop {
-        let name = match number {
-            1 => FOLDER_NAME.to_owned(),
-            n => format!("{FOLDER_NAME} ({n})"),
-        };
-        match storage.create_folder(top, &name).await {
-            Err(Error::NameTaken { .. }) if number < 100 => number += 1,
-            result => return result,
-        }
-    }
 }
 
 /// The first `chars` characters of `text`.

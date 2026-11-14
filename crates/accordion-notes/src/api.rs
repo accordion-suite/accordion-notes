@@ -2,6 +2,8 @@
 //! app. Everything here acts on the signed-in person's own notes. Notes
 //! shared with them come with co-editing (decision 31's second step).
 
+use std::collections::HashSet;
+
 use accordion_core::identity::SignedIn;
 use accordion_core::storage::{Error, Item, ItemKind, Storage};
 use accordion_module::{ApiError, Authenticated};
@@ -45,6 +47,8 @@ struct NoteView {
     pinned: bool,
     archived: bool,
     tags: Vec<String>,
+    /// The folder it's in, or null at the top of the Notes place.
+    folder: Option<ItemId>,
     /// The contents' hash, to send back with changes to the text.
     hash: String,
     created_at: String,
@@ -52,9 +56,10 @@ struct NoteView {
 }
 
 impl NoteView {
-    fn new(indexed: Indexed, body: String) -> Self {
+    fn new(indexed: Indexed, body: String, top: ItemId) -> Self {
         Self {
             id: indexed.id,
+            folder: indexed.folder.filter(|folder| *folder != top),
             title: note::title_of(&indexed.name).to_owned(),
             titled: note::has_title(&indexed.name, &body),
             body,
@@ -73,12 +78,29 @@ impl NoteView {
 struct NotesView {
     notes: Vec<NoteView>,
     labels: Vec<String>,
+    /// Every folder in the Notes place, for the sidebar.
+    folders: Vec<FolderView>,
+    /// The Notes place's top folder, which the web app moves notes and
+    /// folders back into, and makes folders in, through Drive's API, so
+    /// Drive asks before a move shares anything (decision 32).
+    top: ItemId,
+}
+
+/// A folder in the Notes place.
+#[derive(Serialize)]
+struct FolderView {
+    id: ItemId,
+    name: String,
+    /// The folder it's in, or null at the top of the Notes place.
+    parent: Option<ItemId>,
 }
 
 #[derive(Deserialize)]
 struct ListQuery {
     /// Words that all have to be in the title, labels, or text.
     q: Option<String>,
+    /// Only notes in this folder, and in the folders inside it.
+    folder: Option<ItemId>,
 }
 
 /// Storage acting as the signed-in person, so their changes are recorded
@@ -89,7 +111,7 @@ fn by(state: &NotesState, me: &SignedIn) -> Storage {
 
 /// The person's Notes folder, with their index brought up to date.
 async fn ready(state: &NotesState, me: &SignedIn) -> Result<ItemId, ApiError> {
-    let folder = state.store.folder(me.user.id, &by(state, me)).await?;
+    let folder = state.store.folder(me.user.id).await?;
     state.store.follow(me.user.id, folder).await?;
     Ok(folder)
 }
@@ -113,13 +135,38 @@ async fn own_note(
     Ok(item)
 }
 
-/// `GET /notes`: every note, newest first, with the labels.
+/// The folders in the Notes place, and the ones inside `folder`, counting
+/// itself, when there is one. A folder outside the place is "not found".
+async fn folders(
+    state: &NotesState,
+    top: ItemId,
+    folder: Option<ItemId>,
+) -> Result<(Vec<Item>, Option<HashSet<ItemId>>), ApiError> {
+    let all = state.store.folders(top).await?;
+    let Some(folder) = folder else {
+        return Ok((all, None));
+    };
+    if folder != top && !all.iter().any(|item| item.id == folder) {
+        return Err(ApiError::not_found());
+    }
+    let mut within = HashSet::from([folder]);
+    // Parents come before what's inside them, so one pass finds them all.
+    for item in &all {
+        if item.parent.is_some_and(|parent| within.contains(&parent)) {
+            within.insert(item.id);
+        }
+    }
+    Ok((all, Some(within)))
+}
+
+/// `GET /notes`: every note, newest first, with the labels and folders.
 async fn list(
     State(state): State<NotesState>,
     Authenticated(me): Authenticated,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<NotesView>, ApiError> {
-    ready(&state, &me).await?;
+    let top = ready(&state, &me).await?;
+    let (all_folders, within) = folders(&state, top, query.folder).await?;
     let words: Vec<String> = query
         .q
         .unwrap_or_default()
@@ -131,6 +178,12 @@ async fn list(
         .all(me.user.id)
         .await?
         .into_iter()
+        .filter(|indexed| match &within {
+            Some(within) => indexed
+                .folder
+                .is_some_and(|folder| within.contains(&folder)),
+            None => true,
+        })
         .filter(|indexed| {
             if words.is_empty() {
                 return true;
@@ -151,13 +204,23 @@ async fn list(
             let titled = note::has_title(&indexed.name, &indexed.body);
             NoteView {
                 titled,
-                ..NoteView::new(indexed, body)
+                ..NoteView::new(indexed, body, top)
             }
+        })
+        .collect();
+    let folders = all_folders
+        .into_iter()
+        .map(|item| FolderView {
+            id: item.id,
+            name: item.name,
+            parent: item.parent.filter(|parent| *parent != top),
         })
         .collect();
     Ok(Json(NotesView {
         notes,
         labels: state.store.labels(me.user.id).await?,
+        folders,
+        top,
     }))
 }
 
@@ -175,6 +238,8 @@ struct NewNote {
     archived: bool,
     #[serde(default)]
     tags: Vec<String>,
+    /// A folder in the Notes place to save it in, rather than the top.
+    folder: Option<ItemId>,
 }
 
 /// `POST /notes`: takes a note.
@@ -183,7 +248,14 @@ async fn create(
     Authenticated(me): Authenticated,
     Json(request): Json<NewNote>,
 ) -> Result<(StatusCode, Json<NoteView>), ApiError> {
-    let folder = ready(&state, &me).await?;
+    let top = ready(&state, &me).await?;
+    let folder = match request.folder {
+        Some(folder) if folder != top => {
+            folders(&state, top, Some(folder)).await?;
+            folder
+        }
+        _ => top,
+    };
     let mut file = NoteFile::new(&request.body);
     file.set_details(&Details {
         color: check_color(request.color)?,
@@ -201,7 +273,7 @@ async fn create(
     .await?;
     let indexed = state.store.add(me.user.id, &item).await?;
     let body = file.body().to_owned();
-    Ok((StatusCode::CREATED, Json(NoteView::new(indexed, body))))
+    Ok((StatusCode::CREATED, Json(NoteView::new(indexed, body, top))))
 }
 
 /// `GET /notes/{id}`: a note with all of its text.
@@ -214,7 +286,7 @@ async fn open(
     let item = own_note(&state, me.user.id, folder, id).await?;
     let indexed = state.store.add(me.user.id, &item).await?;
     let file = NoteFile::parse(&state.store.read(id).await?);
-    Ok(Json(NoteView::new(indexed, file.body().to_owned())))
+    Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
 }
 
 #[derive(Deserialize)]
@@ -245,7 +317,7 @@ async fn update(
     let item = change_note(&state, &me, item, change).await?;
     let indexed = state.store.add(me.user.id, &item).await?;
     let file = NoteFile::parse(&state.store.read(id).await?);
-    Ok(Json(NoteView::new(indexed, file.body().to_owned())))
+    Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
 }
 
 /// Writes a change to a note's file and name, and returns the note as it
@@ -475,7 +547,7 @@ async fn restore(
     let item = by(&state, &me).restore(id).await?;
     let indexed = state.store.add(me.user.id, &item).await?;
     let file = NoteFile::parse(&state.store.read(id).await?);
-    Ok(Json(NoteView::new(indexed, file.body().to_owned())))
+    Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
 }
 
 /// `DELETE /trash/{id}`: deletes a note in the trash forever.

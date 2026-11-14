@@ -8,7 +8,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 
 Notes is a library crate, `accordion-notes`, that the server in the `accordion` repo builds in. It implements the `Module` trait from `accordion-module` ([decision 7](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0007-module-interface.md)), and requires Drive. [Decision 31](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0031-notes.md) explains the design.
 
-Each note is a Markdown file in a Notes folder in its owner's Drive, so notes sync to computers and open in Obsidian or any editor. What the cards show is in each file's YAML front matter:
+Each note is a Markdown file in its owner's Notes place, which Drive shows as a tab beside My Drive ([decision 32](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0032-a-place-for-each-apps-files.md)), so notes sync to computers and open in Obsidian or any editor. What the cards show is in each file's YAML front matter:
 
 ```markdown
 ---
