@@ -8,10 +8,13 @@
 //! and Notes keeps an index of it in its own tables so lists are quick.
 
 mod api;
+mod format;
 pub mod note;
 mod settings;
+mod shared;
 mod store;
 
+use accordion_core::coedit::CoEditing;
 use accordion_core::db::Migration;
 use accordion_core::identity::Identity;
 use accordion_core::storage::Storage;
@@ -22,7 +25,12 @@ use axum::extract::FromRef;
 const OWNER: &str = "notes";
 
 /// Notes' tables, in the order they were added.
-static MIGRATIONS: &[Migration] = &[store::MIGRATION, store::MIGRATION_2, settings::MIGRATION];
+static MIGRATIONS: &[Migration] = &[
+    store::MIGRATION,
+    store::MIGRATION_2,
+    settings::MIGRATION,
+    shared::MIGRATION,
+];
 
 /// The Notes module. Add it to the server's list of modules.
 pub struct Notes;
@@ -59,7 +67,9 @@ impl Module for Notes {
             services.storage.add_place(store::PLACE);
             let state = NotesState {
                 store: store::Store::new(services.db.clone(), services.storage.clone()),
+                shared: shared::Shared::new(services.db.clone(), services.storage.clone()),
                 settings: settings::Settings::new(services.db),
+                coediting: services.coediting,
                 identity: services.identity,
                 storage: services.storage,
             };
@@ -79,7 +89,9 @@ struct NotesState {
     identity: Identity,
     storage: Storage,
     store: store::Store,
+    shared: shared::Shared,
     settings: settings::Settings,
+    coediting: CoEditing,
 }
 
 impl FromRef<NotesState> for Identity {

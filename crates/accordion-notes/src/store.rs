@@ -225,7 +225,9 @@ impl Store {
                         } else if self.is_note(user, folder, &item).await? {
                             self.add(user, &item).await?;
                         } else {
-                            self.remove(item.id).await?;
+                            // Notes others shared appear in this person's
+                            // changes too, and their rows are the owner's.
+                            self.remove_own(user, item.id).await?;
                         }
                     }
                     SyncChange::Gone(id) => {
@@ -234,7 +236,7 @@ impl Store {
                         }
                         // A folder takes what's in it along, without
                         // naming each item.
-                        if !self.remove(id).await? {
+                        if !self.remove_own(user, id).await? {
                             prune = true;
                         }
                     }
@@ -383,6 +385,19 @@ impl Store {
             })
             .await?;
         Ok(indexed)
+    }
+
+    /// Takes `user`'s note out of the index, leaving anyone else's alone.
+    /// Returns whether it was there.
+    async fn remove_own(&self, user: UserId, id: ItemId) -> Result<bool, Error> {
+        self.db
+            .write(move |tx| {
+                Ok(tx.execute(
+                    "DELETE FROM notes_index WHERE item_id = ?1 AND user_id = ?2",
+                    (id.as_uuid(), user.as_uuid()),
+                )? > 0)
+            })
+            .await
     }
 
     /// Takes a note out of the index. Returns whether it was there.

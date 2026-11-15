@@ -1,10 +1,13 @@
 //! Notes' API, mounted the way the server mounts it, with two people.
 
+use std::time::Duration;
+
+use accordion_core::coedit::{CoEditing, Timing};
 use accordion_core::db::Database;
 use accordion_core::events::{Actor, Events, Via};
 use accordion_core::identity::{AuthMethod, Client, Identity, NewUser};
 use accordion_core::live::Live;
-use accordion_core::storage::{ItemKind, Storage};
+use accordion_core::storage::{ItemKind, ShareLevel, Storage};
 use accordion_core::texts::{self, Texts};
 use accordion_core::thumbnails::{Thumbnails, Tools};
 use accordion_module::{Module, Services, Stopping};
@@ -17,6 +20,13 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tower::ServiceExt;
+
+/// Saves quickly, so tests see co-edited notes reach their files.
+const QUICK: Timing = Timing {
+    save_after: Duration::from_millis(200),
+    save_at_least_every: Duration::from_secs(2),
+    check_access_after: Duration::from_millis(50),
+};
 
 struct Server {
     _dir: tempfile::TempDir,
@@ -61,6 +71,9 @@ async fn start() -> Server {
     .unwrap();
     let services = Services {
         db: db.clone(),
+        coediting: CoEditing::open(db.clone(), storage.clone(), identity.clone(), QUICK)
+            .await
+            .unwrap(),
         identity: identity.clone(),
         storage: storage.clone(),
         events: Events::open(db.clone()).await.unwrap(),
@@ -735,4 +748,337 @@ async fn keeps_each_persons_list_settings() {
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Shares `id` from Alex with Sam.
+async fn share_with_sam(server: &Server, id: &str, level: ShareLevel) {
+    let id: ItemId = id.parse().unwrap();
+    server
+        .as_person(&server.alex)
+        .share(id, server.sam.id, level, server.alex.id)
+        .await
+        .unwrap();
+}
+
+fn find<'a>(notes: &'a [Value], id: &str) -> Option<&'a Value> {
+    notes.iter().find(|note| note["id"] == id)
+}
+
+#[tokio::test]
+async fn shared_notes_show_for_both_with_each_persons_choices() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Groceries", "body": "- [ ] Milk\n", "color": "yellow"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["shared"],
+        false
+    );
+    assert!(find(&server.list(&server.sam).await, &id).is_none());
+
+    share_with_sam(&server, &id, ShareLevel::Viewer).await;
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["shared"],
+        true
+    );
+    let sams = server.list(&server.sam).await;
+    let shared = find(&sams, &id).unwrap();
+    assert_eq!(shared["owner"]["name"], "alex");
+    assert_eq!(shared["access"], "viewer");
+    assert_eq!(shared["color"], "yellow");
+    assert_eq!(shared["title"], "Groceries");
+
+    // Sam's pin and labels are Sam's own, never in Alex's file.
+    let before = server.file_text(&id).await;
+    let (status, changed) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"pinned": true, "tags": ["Shop"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_eq!(changed["pinned"], true);
+    assert_eq!(changed["tags"], json!(["Shop"]));
+    assert_eq!(server.file_text(&id).await, before);
+    let (_, labels) = server.api(&server.sam, "GET", "/labels", None).await;
+    assert_eq!(labels["labels"], json!(["Shop"]));
+    let (_, labels) = server.api(&server.alex, "GET", "/labels", None).await;
+    assert_eq!(labels["labels"], json!([]));
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["pinned"],
+        false
+    );
+
+    // A viewer can't change the note itself.
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"color": "blue"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An editor can, and the color is the note's, so Alex sees it too.
+    share_with_sam(&server, &id, ShareLevel::Editor).await;
+    let (status, changed) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"color": "blue"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert!(server.file_text(&id).await.contains("color: blue"));
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["color"],
+        "blue"
+    );
+
+    // Sam can't move it to the trash, which is Alex's.
+    let (status, _) = server
+        .api(&server.sam, "DELETE", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A Markdown file shared from My Drive stays in Drive.
+    let top = server.storage.top_folder(server.alex.id).await.unwrap();
+    let plan = server
+        .as_person(&server.alex)
+        .write_file(top, "Plan.md", &b"Not a note"[..])
+        .await
+        .unwrap();
+    share_with_sam(&server, &plan.id.to_string(), ShareLevel::Editor).await;
+    let sams = server.list(&server.sam).await;
+    assert!(find(&sams, &plan.id.to_string()).is_none());
+    let (status, _) = server
+        .api(&server.sam, "GET", &format!("/notes/{}", plan.id), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Once it's no longer shared, Sam can't reach it.
+    let note_id: ItemId = id.parse().unwrap();
+    server
+        .storage
+        .unshare(note_id, server.sam.id, server.alex.id)
+        .await
+        .unwrap();
+    let (status, _) = server
+        .api(&server.sam, "GET", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(find(&server.list(&server.sam).await, &id).is_none());
+}
+
+#[tokio::test]
+async fn notes_in_a_shared_folder_are_shared() {
+    let server = start().await;
+    let notes = server.notes_folder(&server.alex).await;
+    let trip = server
+        .as_person(&server.alex)
+        .create_folder(notes, "Trip")
+        .await
+        .unwrap();
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"body": "Passports", "folder": trip.id})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap().to_owned();
+    share_with_sam(&server, &trip.id.to_string(), ShareLevel::Editor).await;
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["shared"],
+        true
+    );
+    let sams = server.list(&server.sam).await;
+    assert_eq!(find(&sams, &id).unwrap()["access"], "editor");
+}
+
+mod live {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::{self, Message};
+    use yrs::encoding::read::Cursor;
+    use yrs::sync::{Message as YMessage, MessageReader, SyncMessage};
+    use yrs::updates::decoder::{Decode, DecoderV1};
+    use yrs::updates::encoder::Encode;
+    use yrs::{Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, Transact, Update};
+
+    use super::*;
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn serve(server: &Server) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = server.router.clone();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        address
+    }
+
+    async fn connect(
+        address: std::net::SocketAddr,
+        person: &Person,
+        id: &str,
+    ) -> Result<Socket, tungstenite::Error> {
+        let mut request = format!("ws://{address}/api/notes/notes/{id}/live")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", person.bearer.parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    /// A browser's copy of the note.
+    struct Browser {
+        doc: Doc,
+        socket: Socket,
+    }
+
+    impl Browser {
+        async fn open(address: std::net::SocketAddr, person: &Person, id: &str) -> Self {
+            let socket = connect(address, person, id).await.unwrap();
+            let doc = Doc::with_options(Options {
+                offset_kind: OffsetKind::Bytes,
+                ..Options::default()
+            });
+            let mut browser = Self { doc, socket };
+            let step1 = YMessage::Sync(SyncMessage::SyncStep1(StateVector::default()));
+            browser.send(step1).await;
+            browser.take_in().await;
+            browser
+        }
+
+        async fn send(&mut self, message: YMessage) {
+            self.socket
+                .send(Message::Binary(message.encode_v1().into()))
+                .await
+                .unwrap();
+        }
+
+        /// Applies what the server sends for a moment.
+        async fn take_in(&mut self) {
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(Duration::from_millis(400), self.socket.next()).await
+            {
+                let Message::Binary(bytes) = message else {
+                    continue;
+                };
+                let mut decoder = DecoderV1::new(Cursor::new(&bytes));
+                for message in MessageReader::new(&mut decoder) {
+                    if let YMessage::Sync(
+                        SyncMessage::SyncStep2(update) | SyncMessage::Update(update),
+                    ) = message.unwrap()
+                    {
+                        let update = Update::decode_v1(&update).unwrap();
+                        self.doc.transact_mut().apply_update(update).unwrap();
+                    }
+                }
+            }
+        }
+
+        fn text(&self, name: &str) -> String {
+            let text = self.doc.get_or_insert_text(name);
+            text.get_string(&self.doc.transact())
+        }
+
+        async fn type_at_end(&mut self, typed: &str) {
+            let body = self.doc.get_or_insert_text("body");
+            let before = self.doc.transact().state_vector();
+            {
+                let mut txn = self.doc.transact_mut();
+                let end = body.len(&txn);
+                body.insert(&mut txn, end, typed);
+            }
+            let update = self.doc.transact().encode_diff_v1(&before);
+            self.send(YMessage::Sync(SyncMessage::Update(update))).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_notes_are_edited_together_and_reach_the_file() {
+        let server = start().await;
+        let address = serve(&server).await;
+        let (_, note) = server
+            .api(
+                &server.alex,
+                "POST",
+                "/notes",
+                Some(json!({"title": "Groceries", "body": "Milk", "color": "yellow"})),
+            )
+            .await;
+        let id = note["id"].as_str().unwrap().to_owned();
+
+        // Nobody reaches a note that isn't shared with them.
+        assert!(connect(address, &server.sam, &id).await.is_err());
+
+        share_with_sam(&server, &id, ShareLevel::Editor).await;
+        let mut sam = Browser::open(address, &server.sam, &id).await;
+        assert_eq!(sam.text("body"), "Milk");
+        assert_eq!(sam.text("front"), "---\ncolor: yellow\n---\n");
+
+        sam.type_at_end(" and eggs").await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            server.file_text(&id).await,
+            "---\ncolor: yellow\n---\nMilk and eggs"
+        );
+
+        // A change through the API lands on top of the typing, and reaches
+        // Sam's copy as edits.
+        sam.type_at_end(", bread").await;
+        let (status, changed) = server
+            .api(
+                &server.alex,
+                "PUT",
+                &format!("/notes/{id}"),
+                Some(json!({"color": "blue"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{changed}");
+        assert_eq!(changed["body"], "Milk and eggs, bread");
+        sam.take_in().await;
+        assert_eq!(sam.text("front"), "---\ncolor: blue\n---\n");
+        assert_eq!(sam.text("body"), "Milk and eggs, bread");
+    }
+
+    #[tokio::test]
+    async fn viewers_watch_but_their_edits_dont_land() {
+        let server = start().await;
+        let address = serve(&server).await;
+        let (_, note) = server
+            .api(
+                &server.alex,
+                "POST",
+                "/notes",
+                Some(json!({"body": "Read me"})),
+            )
+            .await;
+        let id = note["id"].as_str().unwrap().to_owned();
+        share_with_sam(&server, &id, ShareLevel::Viewer).await;
+        let mut sam = Browser::open(address, &server.sam, &id).await;
+        sam.type_at_end(" not").await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(server.file_text(&id).await, "Read me");
+    }
 }

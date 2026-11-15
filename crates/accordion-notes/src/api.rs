@@ -1,22 +1,27 @@
 //! Notes' JSON API, at `/api/notes`, for the web app and later the phone
-//! app. Everything here acts on the signed-in person's own notes. Notes
-//! shared with them come with co-editing (decision 31's second step).
+//! app. It acts on the signed-in person's own notes, and the notes others
+//! shared with them, which people edit together over `/notes/{id}/live`
+//! (decision 31's second step).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use accordion_core::identity::SignedIn;
-use accordion_core::storage::{Error, Item, ItemKind, Storage};
-use accordion_module::{ApiError, Authenticated};
+use accordion_core::storage::{Access, Error, Item, ItemKind, Storage};
+use accordion_module::{ApiError, Authenticated, coedit};
 use accordion_types::{ItemId, UserId};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::NotesState;
+use crate::format::NoteFormat;
 use crate::note::{self, Details, NoteFile};
 use crate::settings::NotesSettings;
+use crate::shared::Choices;
 use crate::store::{Indexed, shorten};
 
 /// How much of each note the list sends, for its card.
@@ -26,6 +31,7 @@ pub(crate) fn routes(state: NotesState) -> Router {
     Router::new()
         .route("/notes", get(list).post(create))
         .route("/notes/{id}", get(open).put(update).delete(trash))
+        .route("/notes/{id}/live", get(live))
         .route("/trash", get(trashed).delete(empty_trash))
         .route("/trash/{id}", axum::routing::delete(delete_forever))
         .route("/trash/{id}/restore", post(restore))
@@ -55,11 +61,70 @@ struct NoteView {
     hash: String,
     created_at: String,
     modified_at: String,
+    /// Whether anyone else can open it. Shared notes are edited together
+    /// over `/notes/{id}/live`.
+    shared: bool,
+    /// Who owns it, when it's someone else's.
+    owner: Option<PersonView>,
+    /// `owner`, `editor`, or `viewer`.
+    access: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct PersonView {
+    id: UserId,
+    /// `None` for an account that was deleted.
+    name: Option<String>,
+}
+
+fn access_name(access: Access) -> &'static str {
+    match access {
+        Access::Owner => "owner",
+        Access::Editor => "editor",
+        Access::Viewer => "viewer",
+    }
 }
 
 impl NoteView {
+    /// Someone else's note: its color from the file, and the rest from what
+    /// the reader chose.
+    fn others(
+        item: &Item,
+        access: Access,
+        text: &str,
+        body: String,
+        choices: Choices,
+        owner: PersonView,
+    ) -> Self {
+        let file = NoteFile::parse(text);
+        let hash = match &item.kind {
+            ItemKind::File { blob, .. } => blob.hash.to_hex(),
+            ItemKind::Folder => String::new(),
+        };
+        Self {
+            id: item.id,
+            title: note::title_of(&item.name).to_owned(),
+            titled: note::has_title(&item.name, file.body()),
+            body,
+            color: file.details().color,
+            pinned: choices.pinned,
+            archived: choices.archived,
+            tags: choices.tags,
+            folder: None,
+            hash,
+            created_at: item.created_at.clone(),
+            modified_at: item.modified_at.clone(),
+            shared: true,
+            owner: Some(owner),
+            access: access_name(access),
+        }
+    }
+
     fn new(indexed: Indexed, body: String, top: ItemId) -> Self {
         Self {
+            shared: false,
+            owner: None,
+            access: "owner",
             id: indexed.id,
             folder: indexed.folder.filter(|folder| *folder != top),
             title: note::title_of(&indexed.name).to_owned(),
@@ -137,6 +202,139 @@ async fn own_note(
     Ok(item)
 }
 
+/// Which of someone's own notes anyone else can open: those shared
+/// directly, and those in a shared folder or a shared Notes place.
+struct Sharing {
+    shared: HashSet<ItemId>,
+    parents: HashMap<ItemId, Option<ItemId>>,
+}
+
+impl Sharing {
+    async fn of(state: &NotesState, user: UserId, top: ItemId) -> Result<Self, ApiError> {
+        Ok(Self {
+            shared: state
+                .storage
+                .shared_by_owner(user)
+                .await?
+                .into_iter()
+                .collect(),
+            parents: state
+                .store
+                .folders(top)
+                .await?
+                .into_iter()
+                .map(|folder| (folder.id, folder.parent))
+                .collect(),
+        })
+    }
+
+    /// Whether the note `id`, in `folder`, is shared.
+    fn covers(&self, id: ItemId, folder: Option<ItemId>) -> bool {
+        if self.shared.contains(&id) {
+            return true;
+        }
+        // Each folder up to the top of the Notes place, whose own parent
+        // isn't among the folders.
+        let mut at = folder;
+        while let Some(current) = at {
+            if self.shared.contains(&current) {
+                return true;
+            }
+            at = self.parents.get(&current).copied().flatten();
+        }
+        false
+    }
+}
+
+/// People's names, looked up once each.
+struct People<'a> {
+    state: &'a NotesState,
+    known: HashMap<UserId, PersonView>,
+}
+
+impl<'a> People<'a> {
+    fn new(state: &'a NotesState) -> Self {
+        Self {
+            state,
+            known: HashMap::new(),
+        }
+    }
+
+    async fn get(&mut self, id: UserId) -> Result<PersonView, ApiError> {
+        if let Some(person) = self.known.get(&id) {
+            return Ok(person.clone());
+        }
+        let name = self
+            .state
+            .identity
+            .user(id)
+            .await?
+            .map(|user| user.display_name);
+        let person = PersonView { id, name };
+        self.known.insert(id, person.clone());
+        Ok(person)
+    }
+}
+
+/// A note the signed-in person can reach: their own, or one shared with
+/// them.
+enum Reached {
+    Own { item: Item, top: ItemId },
+    Others { item: Item, access: Access },
+}
+
+async fn reach(state: &NotesState, me: &SignedIn, id: ItemId) -> Result<Reached, ApiError> {
+    let top = ready(state, me).await?;
+    let item = state
+        .storage
+        .item(id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if state.store.is_note(me.user.id, top, &item).await? {
+        return Ok(Reached::Own { item, top });
+    }
+    match state.shared.note(me.user.id, id).await? {
+        Some((item, access)) => Ok(Reached::Others { item, access }),
+        None => Err(ApiError::not_found()),
+    }
+}
+
+/// One of the person's own notes, as the web app shows it.
+async fn own_view(
+    state: &NotesState,
+    me: &SignedIn,
+    item: &Item,
+    top: ItemId,
+) -> Result<NoteView, ApiError> {
+    let indexed = state.store.add(me.user.id, item).await?;
+    let file = NoteFile::parse(&state.store.read(item.id).await?);
+    let sharing = Sharing::of(state, me.user.id, top).await?;
+    let shared = sharing.covers(indexed.id, indexed.folder);
+    Ok(NoteView {
+        shared,
+        ..NoteView::new(indexed, file.body().to_owned(), top)
+    })
+}
+
+/// Someone else's note, as the web app shows it.
+async fn others_view(
+    state: &NotesState,
+    me: &SignedIn,
+    item: &Item,
+    access: Access,
+) -> Result<NoteView, ApiError> {
+    let text = state.store.read(item.id).await?;
+    let body = NoteFile::parse(&text).body().to_owned();
+    let choices = state
+        .shared
+        .choices(me.user.id)
+        .await?
+        .remove(&item.id)
+        .unwrap_or_default();
+    let owner = People::new(state).get(item.owner).await?;
+    Ok(NoteView::others(item, access, &text, body, choices, owner))
+}
+
 /// The folders in the Notes place, and the ones inside `folder`, counting
 /// itself, when there is one. A folder outside the place is "not found".
 async fn folders(
@@ -161,7 +359,17 @@ async fn folders(
     Ok((all, Some(within)))
 }
 
+/// Whether a note's title, labels, or text has every word.
+fn matches(words: &[String], name: &str, tags: &[String], body: &str) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let text = format!("{}\n{}\n{}", note::title_of(name), tags.join("\n"), body).to_lowercase();
+    words.iter().all(|word| text.contains(word))
+}
+
 /// `GET /notes`: every note, newest first, with the labels and folders.
+/// Notes others shared show everywhere but in a folder.
 async fn list(
     State(state): State<NotesState>,
     Authenticated(me): Authenticated,
@@ -175,7 +383,8 @@ async fn list(
         .split_whitespace()
         .map(str::to_lowercase)
         .collect();
-    let notes = state
+    let sharing = Sharing::of(&state, me.user.id, top).await?;
+    let mut notes: Vec<NoteView> = state
         .store
         .all(me.user.id)
         .await?
@@ -186,30 +395,36 @@ async fn list(
                 .is_some_and(|folder| within.contains(&folder)),
             None => true,
         })
-        .filter(|indexed| {
-            if words.is_empty() {
-                return true;
-            }
-            let text = format!(
-                "{}\n{}\n{}",
-                note::title_of(&indexed.name),
-                indexed.details.tags.join("\n"),
-                indexed.body
-            )
-            .to_lowercase();
-            words.iter().all(|word| text.contains(word))
-        })
+        .filter(|indexed| matches(&words, &indexed.name, &indexed.details.tags, &indexed.body))
         .map(|indexed| {
             let body = shorten(&indexed.body, CARD_CHARS);
             // Whether it has a title depends on the whole first line, which
             // the index has.
             let titled = note::has_title(&indexed.name, &indexed.body);
+            let shared = sharing.covers(indexed.id, indexed.folder);
             NoteView {
                 titled,
+                shared,
                 ..NoteView::new(indexed, body, top)
             }
         })
         .collect();
+    if within.is_none() {
+        let mut choices = state.shared.choices(me.user.id).await?;
+        let mut people = People::new(&state);
+        for (item, access) in state.shared.notes(me.user.id).await? {
+            let text = state.store.read(item.id).await?;
+            let mine = choices.remove(&item.id).unwrap_or_default();
+            let body = NoteFile::parse(&text).body().to_owned();
+            if !matches(&words, &item.name, &mine.tags, &body) {
+                continue;
+            }
+            let owner = people.get(item.owner).await?;
+            let short = shorten(&body, CARD_CHARS);
+            notes.push(NoteView::others(&item, access, &text, short, mine, owner));
+        }
+        notes.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    }
     let folders = all_folders
         .into_iter()
         .map(|item| FolderView {
@@ -220,7 +435,7 @@ async fn list(
         .collect();
     Ok(Json(NotesView {
         notes,
-        labels: state.store.labels(me.user.id).await?,
+        labels: all_labels(&state, me.user.id).await?,
         folders,
         top,
     }))
@@ -284,11 +499,29 @@ async fn open(
     Authenticated(me): Authenticated,
     Path(id): Path<ItemId>,
 ) -> Result<Json<NoteView>, ApiError> {
-    let folder = ready(&state, &me).await?;
-    let item = own_note(&state, me.user.id, folder, id).await?;
-    let indexed = state.store.add(me.user.id, &item).await?;
-    let file = NoteFile::parse(&state.store.read(id).await?);
-    Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
+    match reach(&state, &me, id).await? {
+        Reached::Own { item, top } => Ok(Json(own_view(&state, &me, &item, top).await?)),
+        Reached::Others { item, access } => {
+            Ok(Json(others_view(&state, &me, &item, access).await?))
+        }
+    }
+}
+
+/// `GET /notes/{id}/live`: a WebSocket for editing a note together with
+/// everyone else who has it open (decision 30). Viewers see the edits but
+/// can't make them.
+async fn live(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+    socket: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    reach(&state, &me, id).await?;
+    let connection = state
+        .coediting
+        .join(id, me.user.id, Some(me.session.id), Arc::new(NoteFormat))
+        .await?;
+    Ok(coedit::upgrade(socket, connection))
 }
 
 #[derive(Deserialize)]
@@ -312,14 +545,51 @@ async fn update(
     State(state): State<NotesState>,
     Authenticated(me): Authenticated,
     Path(id): Path<ItemId>,
-    Json(change): Json<NoteChange>,
+    Json(mut change): Json<NoteChange>,
 ) -> Result<Json<NoteView>, ApiError> {
-    let folder = ready(&state, &me).await?;
-    let item = own_note(&state, me.user.id, folder, id).await?;
-    let item = change_note(&state, &me, item, change).await?;
-    let indexed = state.store.add(me.user.id, &item).await?;
-    let file = NoteFile::parse(&state.store.read(id).await?);
-    Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
+    // Typing that people are doing together goes into the file first, so
+    // this change lands on top of it, and they see the change as edits.
+    state.coediting.save_now(id).await;
+    match reach(&state, &me, id).await? {
+        Reached::Own { item, top } => {
+            let item = change_note(&state, &me, item, change).await?;
+            Ok(Json(own_view(&state, &me, &item, top).await?))
+        }
+        Reached::Others { item, access } => {
+            // Pins, the archive, and labels are the reader's own.
+            if change.pinned.is_some() || change.archived.is_some() || change.tags.is_some() {
+                let mut choices = state
+                    .shared
+                    .choices(me.user.id)
+                    .await?
+                    .remove(&item.id)
+                    .unwrap_or_default();
+                if let Some(pinned) = change.pinned.take() {
+                    choices.pinned = pinned;
+                }
+                if let Some(archived) = change.archived.take() {
+                    choices.archived = archived;
+                }
+                if let Some(tags) = change.tags.take() {
+                    choices.tags = check_tags(tags)?;
+                }
+                state.shared.set(me.user.id, item.id, choices).await?;
+            }
+            let item = if change.title.is_some() || change.body.is_some() || change.color.is_some()
+            {
+                if access == Access::Viewer {
+                    return Err(ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "You can see this note, but not change it. Ask its owner to make you an editor.",
+                    ));
+                }
+                change_note(&state, &me, item, change).await?
+            } else {
+                item
+            };
+            Ok(Json(others_view(&state, &me, &item, access).await?))
+        }
+    }
 }
 
 /// Writes a change to a note's file and name, and returns the note as it
@@ -614,7 +884,7 @@ async fn labels(
 ) -> Result<Json<LabelsView>, ApiError> {
     ready(&state, &me).await?;
     Ok(Json(LabelsView {
-        labels: state.store.labels(me.user.id).await?,
+        labels: all_labels(&state, me.user.id).await?,
     }))
 }
 
@@ -628,7 +898,7 @@ async fn add_label(
     let label = check_label(&request.name)?;
     state.store.keep_label(me.user.id, label, true).await?;
     Ok(Json(LabelsView {
-        labels: state.store.labels(me.user.id).await?,
+        labels: all_labels(&state, me.user.id).await?,
     }))
 }
 
@@ -649,20 +919,7 @@ async fn relabel(
         {
             continue;
         }
-        let mut tags: Vec<String> = Vec::new();
-        for tag in indexed.details.tags {
-            let tag = if tag.eq_ignore_ascii_case(from) {
-                match to {
-                    Some(to) => to.to_owned(),
-                    None => continue,
-                }
-            } else {
-                tag
-            };
-            if !tags.iter().any(|seen| seen.eq_ignore_ascii_case(&tag)) {
-                tags.push(tag);
-            }
-        }
+        let tags = renamed(indexed.details.tags, from, to);
         let item = own_note(state, me.user.id, folder, indexed.id).await?;
         let item = change_note(
             state,
@@ -681,11 +938,57 @@ async fn relabel(
         .await?;
         state.store.add(me.user.id, &item).await?;
     }
+    // And on notes others shared, where labels are the person's own.
+    for (item, mut choices) in state.shared.choices(me.user.id).await? {
+        if choices
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case(from))
+        {
+            choices.tags = renamed(choices.tags, from, to);
+            state.shared.set(me.user.id, item, choices).await?;
+        }
+    }
     state
         .store
         .keep_label(me.user.id, from.to_owned(), false)
         .await?;
     Ok(())
+}
+
+/// `tags` with `from` renamed to `to`, or taken off without one, and no
+/// label twice.
+fn renamed(tags: Vec<String>, from: &str, to: Option<&str>) -> Vec<String> {
+    let mut renamed: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = if tag.eq_ignore_ascii_case(from) {
+            match to {
+                Some(to) => to.to_owned(),
+                None => continue,
+            }
+        } else {
+            tag
+        };
+        if !renamed.iter().any(|seen| seen.eq_ignore_ascii_case(&tag)) {
+            renamed.push(tag);
+        }
+    }
+    renamed
+}
+
+/// Every label the person has: on their own notes, kept for later, and on
+/// notes others shared with them.
+async fn all_labels(state: &NotesState, user: UserId) -> Result<Vec<String>, ApiError> {
+    let mut labels = state.store.labels(user).await?;
+    for choices in state.shared.choices(user).await?.into_values() {
+        for tag in choices.tags {
+            if !labels.iter().any(|label| label.eq_ignore_ascii_case(&tag)) {
+                labels.push(tag);
+            }
+        }
+    }
+    labels.sort_by_key(|label| label.to_lowercase());
+    Ok(labels)
 }
 
 /// `PUT /labels/{name}`: renames a label on every note that has it.
@@ -700,7 +1003,7 @@ async fn rename_label(
     // Kept even if no note has it, as Keep does.
     state.store.keep_label(me.user.id, to, true).await?;
     Ok(Json(LabelsView {
-        labels: state.store.labels(me.user.id).await?,
+        labels: all_labels(&state, me.user.id).await?,
     }))
 }
 
@@ -712,6 +1015,6 @@ async fn remove_label(
 ) -> Result<Json<LabelsView>, ApiError> {
     relabel(&state, &me, &name, None).await?;
     Ok(Json(LabelsView {
-        labels: state.store.labels(me.user.id).await?,
+        labels: all_labels(&state, me.user.id).await?,
     }))
 }
