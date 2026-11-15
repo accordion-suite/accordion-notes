@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::NotesState;
 use crate::note::{self, Details, NoteFile};
+use crate::settings::NotesSettings;
 use crate::store::{Indexed, shorten};
 
 /// How much of each note the list sends, for its card.
@@ -30,6 +31,7 @@ pub(crate) fn routes(state: NotesState) -> Router {
         .route("/trash/{id}/restore", post(restore))
         .route("/labels", get(labels).post(add_label))
         .route("/labels/{name}", put(rename_label).delete(remove_label))
+        .route("/settings", get(get_settings).put(put_settings))
         .with_state(state)
 }
 
@@ -585,6 +587,24 @@ struct LabelsView {
 #[serde(deny_unknown_fields)]
 struct LabelName {
     name: String,
+}
+
+/// `GET /settings`: the signed-in person's Notes settings.
+async fn get_settings(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+) -> Result<Json<NotesSettings>, ApiError> {
+    Ok(Json(state.settings.get(me.user.id).await?))
+}
+
+/// `PUT /settings`: replaces them, so send every setting.
+async fn put_settings(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Json(settings): Json<NotesSettings>,
+) -> Result<StatusCode, ApiError> {
+    state.settings.set(me.user.id, settings).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /labels`: the person's labels, in order.

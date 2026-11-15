@@ -693,3 +693,46 @@ async fn reports_the_size_of_everyones_notes() {
         .await;
     assert_eq!(Notes.data_size(&server.services).await, Some(5));
 }
+
+#[tokio::test]
+async fn keeps_each_persons_list_settings() {
+    let server = start().await;
+    let (status, body) = server.api(&server.alex, "GET", "/settings", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({"new_items": "bottom", "checked_at_bottom": true})
+    );
+
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "PUT",
+            "/settings",
+            Some(json!({"new_items": "top", "checked_at_bottom": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = server.api(&server.alex, "GET", "/settings", None).await;
+    assert_eq!(
+        body,
+        json!({"new_items": "top", "checked_at_bottom": false})
+    );
+
+    // Sam's stay as they were.
+    let (_, body) = server.api(&server.sam, "GET", "/settings", None).await;
+    assert_eq!(
+        body,
+        json!({"new_items": "bottom", "checked_at_bottom": true})
+    );
+
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "PUT",
+            "/settings",
+            Some(json!({"new_items": "middle", "checked_at_bottom": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

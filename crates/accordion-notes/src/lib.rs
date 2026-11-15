@@ -9,6 +9,7 @@
 
 mod api;
 pub mod note;
+mod settings;
 mod store;
 
 use accordion_core::db::Migration;
@@ -21,7 +22,7 @@ use axum::extract::FromRef;
 const OWNER: &str = "notes";
 
 /// Notes' tables, in the order they were added.
-static MIGRATIONS: &[Migration] = &[store::MIGRATION, store::MIGRATION_2];
+static MIGRATIONS: &[Migration] = &[store::MIGRATION, store::MIGRATION_2, settings::MIGRATION];
 
 /// The Notes module. Add it to the server's list of modules.
 pub struct Notes;
@@ -57,7 +58,8 @@ impl Module for Notes {
             services.db.migrate(OWNER, MIGRATIONS).await?;
             services.storage.add_place(store::PLACE);
             let state = NotesState {
-                store: store::Store::new(services.db, services.storage.clone()),
+                store: store::Store::new(services.db.clone(), services.storage.clone()),
+                settings: settings::Settings::new(services.db),
                 identity: services.identity,
                 storage: services.storage,
             };
@@ -77,6 +79,7 @@ struct NotesState {
     identity: Identity,
     storage: Storage,
     store: store::Store,
+    settings: settings::Settings,
 }
 
 impl FromRef<NotesState> for Identity {
