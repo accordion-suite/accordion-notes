@@ -22,6 +22,7 @@ use accordion_types::{ItemId, UserId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
+use crate::links;
 use crate::note::{self, NoteFile};
 
 pub(crate) const MIGRATION: Migration = Migration {
@@ -77,6 +78,62 @@ pub(crate) const MIGRATION_2: Migration = Migration {
     DELETE FROM notes_folders;
     ",
 };
+
+pub(crate) const MIGRATION_6: Migration = Migration {
+    version: 6,
+    name: "Know the files beside notes, and each note's links to them",
+    sql: "
+    -- Every file in a Notes place that isn't a note, such as an image, with
+    -- its path from the top of the place, so links follow it when it moves.
+    CREATE TABLE notes_files (
+        item_id BLOB PRIMARY KEY NOT NULL CHECK (length(item_id) = 16),
+        user_id BLOB NOT NULL CHECK (length(user_id) = 16),
+        parent_id BLOB NOT NULL CHECK (length(parent_id) = 16),
+        path TEXT NOT NULL
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX notes_files_by_path ON notes_files (user_id, path);
+
+    -- Each note's links to files, in order, as its file last said.
+    CREATE TABLE notes_links (
+        note_id BLOB NOT NULL CHECK (length(note_id) = 16),
+        position INTEGER NOT NULL,
+        user_id BLOB NOT NULL CHECK (length(user_id) = 16),
+        target TEXT NOT NULL,
+        embed INTEGER NOT NULL CHECK (embed IN (0, 1)),
+        PRIMARY KEY (note_id, position)
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX notes_links_by_target ON notes_links (user_id, target);
+
+    -- Images that went to the trash with a note, which come back with it.
+    CREATE TABLE notes_trashed_with (
+        note_id BLOB NOT NULL CHECK (length(note_id) = 16),
+        item_id BLOB NOT NULL CHECK (length(item_id) = 16),
+        PRIMARY KEY (note_id, item_id)
+    ) STRICT, WITHOUT ROWID;
+
+    -- Every note is read again for its links, and every place listed again
+    -- for its files.
+    UPDATE notes_index SET hash = '';
+    UPDATE notes_folders SET cursor = NULL;
+    ",
+};
+
+/// A file in a Notes place that isn't a note, such as an image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Beside {
+    pub id: ItemId,
+    /// The folder it's in.
+    pub parent: ItemId,
+    /// Its path from the top of the Notes place, such as `Garden/a.jpg`.
+    pub path: String,
+}
+
+/// A link in a note, as the index has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NoteLink {
+    pub target: String,
+    pub embed: bool,
+}
 
 /// Notes' place beside My Drive.
 pub(crate) const PLACE: AppPlace = AppPlace {
@@ -203,6 +260,7 @@ impl Store {
             return self.list_again(user, folder).await;
         };
         let mut prune = false;
+        let mut renamed = Vec::new();
         loop {
             let page = match self.storage.changes(user, &cursor).await {
                 Ok(page) => page,
@@ -217,6 +275,7 @@ impl Store {
                             // A folder of notes moved in or out, or was
                             // restored, so everything inside changed.
                             if entry.whole || item.id != folder {
+                                // Files inside may have new paths too.
                                 prune = true;
                                 if self.storage.path_within(folder, item.id).await?.is_some() {
                                     self.add_folder(user, folder, item.id).await?;
@@ -228,6 +287,9 @@ impl Store {
                             // Notes others shared appear in this person's
                             // changes too, and their rows are the owner's.
                             self.remove_own(user, item.id).await?;
+                            if item.owner == user {
+                                renamed.extend(self.track(user, folder, &item).await?);
+                            }
                         }
                     }
                     SyncChange::Gone(id) => {
@@ -236,7 +298,7 @@ impl Store {
                         }
                         // A folder takes what's in it along, without
                         // naming each item.
-                        if !self.remove_own(user, id).await? {
+                        if !self.remove_own(user, id).await? && !self.untrack(user, id).await? {
                             prune = true;
                         }
                     }
@@ -249,8 +311,10 @@ impl Store {
         }
         if prune {
             self.prune(user, folder).await?;
+            renamed.extend(self.files_again(user, folder).await?);
         }
-        self.save_cursor(user, Some(cursor)).await
+        self.save_cursor(user, Some(cursor)).await?;
+        self.repair(user, folder, renamed).await
     }
 
     /// Lists the whole folder again, such as the first time, or when the
@@ -262,7 +326,9 @@ impl Store {
         for id in indexed.difference(&seen) {
             self.remove(*id).await?;
         }
-        self.save_cursor(user, Some(start.cursor)).await
+        let renamed = self.files_again(user, folder).await?;
+        self.save_cursor(user, Some(start.cursor)).await?;
+        self.repair(user, folder, renamed).await
     }
 
     /// Indexes every note inside `within`, and returns their IDs.
@@ -334,12 +400,23 @@ impl Store {
         let hash = blob.hash.to_hex();
         let id = item.id;
         let known = self.get(id).await?;
-        let (details, body) = match known {
-            Some(known) if known.hash == hash => (known.details, known.body),
+        let (details, body, links) = match known {
+            Some(known) if known.hash == hash => (known.details, known.body, None),
             _ => {
                 let text = self.read(id).await?;
                 let file = NoteFile::parse(&text);
-                (file.details(), shorten(file.body(), BODY_CHARS))
+                let links: Vec<NoteLink> = links::links(file.body())
+                    .into_iter()
+                    .map(|link| NoteLink {
+                        target: link.target,
+                        embed: link.embed,
+                    })
+                    .collect();
+                (
+                    file.details(),
+                    shorten(file.body(), BODY_CHARS),
+                    Some(links),
+                )
             }
         };
         let indexed = Indexed {
@@ -381,6 +458,25 @@ impl Store {
                         row.folder.map(|folder| folder.as_uuid()),
                     ],
                 )?;
+                if let Some(links) = links {
+                    tx.execute(
+                        "DELETE FROM notes_links WHERE note_id = ?1",
+                        [row.id.as_uuid()],
+                    )?;
+                    for (position, link) in links.into_iter().enumerate() {
+                        tx.execute(
+                            "INSERT INTO notes_links (note_id, position, user_id, target, embed)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![
+                                row.id.as_uuid(),
+                                position as i64,
+                                user.as_uuid(),
+                                link.target,
+                                link.embed,
+                            ],
+                        )?;
+                    }
+                }
                 Ok::<_, Error>(())
             })
             .await?;
@@ -392,6 +488,10 @@ impl Store {
     async fn remove_own(&self, user: UserId, id: ItemId) -> Result<bool, Error> {
         self.db
             .write(move |tx| {
+                tx.execute(
+                    "DELETE FROM notes_links WHERE note_id = ?1 AND user_id = ?2",
+                    (id.as_uuid(), user.as_uuid()),
+                )?;
                 Ok(tx.execute(
                     "DELETE FROM notes_index WHERE item_id = ?1 AND user_id = ?2",
                     (id.as_uuid(), user.as_uuid()),
@@ -404,6 +504,7 @@ impl Store {
     pub(crate) async fn remove(&self, id: ItemId) -> Result<bool, Error> {
         self.db
             .write(move |tx| {
+                tx.execute("DELETE FROM notes_links WHERE note_id = ?1", [id.as_uuid()])?;
                 Ok(tx.execute("DELETE FROM notes_index WHERE item_id = ?1", [id.as_uuid()])? > 0)
             })
             .await
@@ -499,6 +600,274 @@ impl Store {
             .await
     }
 
+    /// Notes where a file in `user`'s Notes place is, such as an image.
+    /// Returns the old path and the new one if it moved or was renamed.
+    async fn track(
+        &self,
+        user: UserId,
+        top: ItemId,
+        item: &Item,
+    ) -> Result<Option<(String, String)>, Error> {
+        let Some(path) = self.storage.path_within(top, item.id).await? else {
+            self.untrack(user, item.id).await?;
+            return Ok(None);
+        };
+        let Some(parent) = item.parent else {
+            return Ok(None);
+        };
+        let path = path_text(&path);
+        let (id, new) = (item.id, path.clone());
+        let old = self
+            .db
+            .write(move |tx| {
+                let old: Option<String> = tx
+                    .query_row(
+                        "SELECT path FROM notes_files WHERE item_id = ?1",
+                        [id.as_uuid()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                tx.execute(
+                    "INSERT INTO notes_files (item_id, user_id, parent_id, path)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (item_id) DO UPDATE SET
+                         user_id = excluded.user_id, parent_id = excluded.parent_id,
+                         path = excluded.path",
+                    (id.as_uuid(), user.as_uuid(), parent.as_uuid(), &new),
+                )?;
+                Ok::<_, Error>(old)
+            })
+            .await?;
+        Ok(old.filter(|old| *old != path).map(|old| (old, path)))
+    }
+
+    /// Forgets a file that's gone. Returns whether Notes knew it.
+    async fn untrack(&self, user: UserId, id: ItemId) -> Result<bool, Error> {
+        self.db
+            .write(move |tx| {
+                Ok(tx.execute(
+                    "DELETE FROM notes_files WHERE item_id = ?1 AND user_id = ?2",
+                    (id.as_uuid(), user.as_uuid()),
+                )? > 0)
+            })
+            .await
+    }
+
+    /// Lists every file in `user`'s Notes place again, such as after a
+    /// folder moved, and returns the ones whose paths changed, with their
+    /// old paths and new ones.
+    async fn files_again(&self, user: UserId, top: ItemId) -> Result<Vec<(String, String)>, Error> {
+        let mut found = Vec::new();
+        let mut waiting = vec![(top, String::new())];
+        while let Some((folder, at)) = waiting.pop() {
+            for child in self.storage.children(folder).await? {
+                let path = if at.is_empty() {
+                    child.name.clone()
+                } else {
+                    format!("{at}/{}", child.name)
+                };
+                match child.kind {
+                    ItemKind::Folder => waiting.push((child.id, path)),
+                    ItemKind::File { .. } if !note::is_note(&child.name) => found.push(Beside {
+                        id: child.id,
+                        parent: folder,
+                        path,
+                    }),
+                    ItemKind::File { .. } => {}
+                }
+            }
+        }
+        self.db
+            .write(move |tx| {
+                let mut known: std::collections::HashMap<ItemId, String> = {
+                    let mut statement =
+                        tx.prepare("SELECT item_id, path FROM notes_files WHERE user_id = ?1")?;
+                    statement
+                        .query_map([user.as_uuid()], |row| {
+                            Ok((ItemId::from_uuid(row.get(0)?), row.get(1)?))
+                        })?
+                        .collect::<Result<_, _>>()?
+                };
+                let mut renamed = Vec::new();
+                for file in &found {
+                    if let Some(old) = known.remove(&file.id)
+                        && old != file.path
+                    {
+                        renamed.push((old, file.path.clone()));
+                    }
+                    tx.execute(
+                        "INSERT INTO notes_files (item_id, user_id, parent_id, path)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT (item_id) DO UPDATE SET
+                             user_id = excluded.user_id, parent_id = excluded.parent_id,
+                             path = excluded.path",
+                        (
+                            file.id.as_uuid(),
+                            user.as_uuid(),
+                            file.parent.as_uuid(),
+                            &file.path,
+                        ),
+                    )?;
+                }
+                for gone in known.keys() {
+                    tx.execute(
+                        "DELETE FROM notes_files WHERE item_id = ?1",
+                        [gone.as_uuid()],
+                    )?;
+                }
+                Ok::<_, Error>(renamed)
+            })
+            .await
+    }
+
+    /// Points `user`'s links at files' new paths, as a new version of each
+    /// note that had one.
+    async fn repair(
+        &self,
+        user: UserId,
+        top: ItemId,
+        renamed: Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        for (old, new) in renamed {
+            let target = old.clone();
+            let notes: Vec<ItemId> = self
+                .db
+                .read(move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT DISTINCT note_id FROM notes_links
+                         WHERE user_id = ?1 AND target = ?2",
+                    )?;
+                    let notes = statement
+                        .query_map((user.as_uuid(), &target), |row| {
+                            Ok(ItemId::from_uuid(row.get(0)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    Ok::<_, Error>(notes)
+                })
+                .await?;
+            for id in notes {
+                // Someone may save the note in between, so it's tried again
+                // on their text.
+                for _ in 0..3 {
+                    let Some(item) = self.storage.item(id).await? else {
+                        break;
+                    };
+                    let ItemKind::File { blob, .. } = &item.kind else {
+                        break;
+                    };
+                    if !self.is_note(user, top, &item).await? {
+                        break;
+                    }
+                    let mut file = NoteFile::parse(&self.read(id).await?);
+                    let Some(body) = links::rewrite(file.body(), &old, &new) else {
+                        break;
+                    };
+                    file.set_body(&body);
+                    match self
+                        .storage
+                        .write_version(id, blob.hash, file.text().as_bytes())
+                        .await
+                    {
+                        Ok(item) => {
+                            self.add(user, &item).await?;
+                            break;
+                        }
+                        Err(Error::Changed) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every file in `user`'s Notes place that isn't a note.
+    pub(crate) async fn files(&self, user: UserId) -> Result<Vec<Beside>, Error> {
+        self.db
+            .read(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT item_id, parent_id, path FROM notes_files WHERE user_id = ?1",
+                )?;
+                let files = statement
+                    .query_map([user.as_uuid()], |row| {
+                        Ok(Beside {
+                            id: ItemId::from_uuid(row.get(0)?),
+                            parent: ItemId::from_uuid(row.get(1)?),
+                            path: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<_, _>>()?;
+                Ok(files)
+            })
+            .await
+    }
+
+    /// Each of `user`'s notes' links, in order.
+    pub(crate) async fn links(
+        &self,
+        user: UserId,
+    ) -> Result<std::collections::HashMap<ItemId, Vec<NoteLink>>, Error> {
+        self.db
+            .read(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT note_id, target, embed FROM notes_links
+                     WHERE user_id = ?1 ORDER BY note_id, position",
+                )?;
+                let mut links: std::collections::HashMap<ItemId, Vec<NoteLink>> =
+                    std::collections::HashMap::new();
+                let rows = statement.query_map([user.as_uuid()], |row| {
+                    Ok((
+                        ItemId::from_uuid(row.get(0)?),
+                        NoteLink {
+                            target: row.get(1)?,
+                            embed: row.get(2)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (note, link) = row?;
+                    links.entry(note).or_default().push(link);
+                }
+                Ok(links)
+            })
+            .await
+    }
+
+    /// Remembers the images that went to the trash with a note.
+    pub(crate) async fn trashed_with(&self, note: ItemId, items: Vec<ItemId>) -> Result<(), Error> {
+        self.db
+            .write(move |tx| {
+                for item in items {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO notes_trashed_with (note_id, item_id) VALUES (?1, ?2)",
+                        (note.as_uuid(), item.as_uuid()),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The images that went to the trash with a note, now forgotten.
+    pub(crate) async fn take_trashed_with(&self, note: ItemId) -> Result<Vec<ItemId>, Error> {
+        self.db
+            .write(move |tx| {
+                let items = {
+                    let mut statement =
+                        tx.prepare("SELECT item_id FROM notes_trashed_with WHERE note_id = ?1")?;
+                    statement
+                        .query_map([note.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                tx.execute(
+                    "DELETE FROM notes_trashed_with WHERE note_id = ?1",
+                    [note.as_uuid()],
+                )?;
+                Ok(items)
+            })
+            .await
+    }
+
     /// The total size of everyone's notes, for the Modules page.
     pub(crate) async fn size(&self) -> Result<u64, Error> {
         let folders: Vec<ItemId> = self
@@ -535,6 +904,16 @@ fn indexed_from_row(row: &Row<'_>) -> rusqlite::Result<Indexed> {
         modified_at: row.get(9)?,
         folder: row.get::<_, Option<_>>(10)?.map(ItemId::from_uuid),
     })
+}
+
+/// An item's path from the top of a place, given the items from the top
+/// down to it, as [`Storage::path_within`] returns them.
+pub(crate) fn path_text(path: &[Item]) -> String {
+    path.iter()
+        .skip(1)
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The first `chars` characters of `text`.

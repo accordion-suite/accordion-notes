@@ -10,6 +10,8 @@
 
 mod api;
 mod format;
+mod images;
+mod links;
 pub mod note;
 mod reminders;
 mod settings;
@@ -21,6 +23,7 @@ use accordion_core::db::Migration;
 use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::Storage;
+use accordion_core::thumbnails::Thumbnails;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
 use axum::extract::FromRef;
 
@@ -34,6 +37,7 @@ static MIGRATIONS: &[Migration] = &[
     settings::MIGRATION,
     shared::MIGRATION,
     reminders::MIGRATION,
+    store::MIGRATION_6,
 ];
 
 /// The Notes module. Add it to the server's list of modules.
@@ -83,6 +87,7 @@ impl Module for Notes {
                 shared: shared::Shared::new(services.db.clone(), services.storage.clone()),
                 settings: settings::Settings::new(services.db),
                 coediting: services.coediting,
+                thumbnails: services.thumbnails,
                 identity: services.identity,
                 storage: services.storage,
             };
@@ -107,6 +112,7 @@ struct NotesState {
     reminders: reminders::Reminders,
     live: Live,
     coediting: CoEditing,
+    thumbnails: Thumbnails,
 }
 
 impl FromRef<NotesState> for Identity {

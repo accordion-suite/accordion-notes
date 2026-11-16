@@ -154,6 +154,27 @@ impl Server {
         (status, value)
     }
 
+    /// A request with raw bytes, for pictures, and the raw reply.
+    async fn raw(
+        &self,
+        person: &Person,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/api/notes{path}"))
+            .header("authorization", &person.bearer)
+            .body(Body::from(body))
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, bytes.to_vec())
+    }
+
     /// Storage acting as `person`, the way Drive, WebDAV, or sync would.
     fn as_person(&self, person: &Person) -> Storage {
         self.storage
@@ -1257,4 +1278,343 @@ fn in_two_hours() -> String {
     jiff::Timestamp::from_second(now + 7_200)
         .unwrap()
         .to_string()
+}
+
+/// Bytes that start like a JPEG, which is all Notes looks at.
+const PHOTO: &[u8] = b"\xff\xd8\xff\xe0 a photo";
+
+/// Adds a picture to a note and returns its path and line.
+async fn add_photo(server: &Server, person: &Person, note: &str, name: &str) -> (String, String) {
+    let (status, _, body) = server
+        .raw(
+            person,
+            "POST",
+            &format!("/notes/{note}/images?name={name}"),
+            PHOTO.to_vec(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let added: Value = serde_json::from_slice(&body).unwrap();
+    (
+        added["path"].as_str().unwrap().to_owned(),
+        added["line"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// Puts `line` at the top of a note's text.
+async fn show_at_top(server: &Server, person: &Person, note: &str, line: &str) {
+    let (_, opened) = server
+        .api(person, "GET", &format!("/notes/{note}"), None)
+        .await;
+    let body = format!("{line}\n{}", opened["body"].as_str().unwrap());
+    let (status, changed) = server
+        .api(
+            person,
+            "PUT",
+            &format!("/notes/{note}"),
+            Some(json!({"base": opened["hash"], "body": body})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+}
+
+fn image_address(note: &str, path: &str) -> String {
+    format!(
+        "/notes/{note}/image?path={}",
+        path.replace('%', "%25")
+            .replace(' ', "%20")
+            .replace('/', "%2F")
+    )
+}
+
+#[tokio::test]
+async fn images_go_beside_their_note_and_links_follow_them() {
+    let server = start().await;
+    let top = server.notes_folder(&server.alex).await;
+    let alex = server.as_person(&server.alex);
+    let garden = alex.create_folder(top, "Garden").await.unwrap();
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Groceries", "body": "Milk", "folder": garden.id})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+
+    let (path, line) = add_photo(&server, &server.alex, id, "IMG_0001.JPG").await;
+    assert_eq!(path, "Garden/Groceries 1.jpg");
+    assert_eq!(line, "![](Garden/Groceries%201.jpg)");
+    let (second, _) = add_photo(&server, &server.alex, id, "b.png").await;
+    assert_eq!(second, "Garden/Groceries 2.png");
+    show_at_top(&server, &server.alex, id, &line).await;
+
+    // The note's list shows only notes, and knows the image beside it.
+    let notes = server.list(&server.alex).await;
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["images"][0]["name"], "Groceries 1.jpg");
+    assert_eq!(notes[0]["images"][0]["beside"], true);
+
+    let (status, headers, bytes) = server
+        .raw(&server.alex, "GET", &image_address(id, &path), Vec::new())
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/jpeg");
+    assert_eq!(headers["content-security-policy"], "sandbox");
+    assert_eq!(bytes, PHOTO);
+
+    // Moved and renamed in Drive, the image keeps its link.
+    let photo = server
+        .storage
+        .find(garden.id, vec!["Groceries 1.jpg".into()])
+        .await
+        .unwrap()
+        .unwrap();
+    alex.move_item(photo.id, top, "Moved.jpg").await.unwrap();
+    server.list(&server.alex).await;
+    assert!(server.file_text(id).await.contains("![](Moved.jpg)\n"));
+
+    // So does an image whose folder moves.
+    let pictures = alex.create_folder(top, "Pictures").await.unwrap();
+    alex.move_item(photo.id, pictures.id, "Moved.jpg")
+        .await
+        .unwrap();
+    server.list(&server.alex).await;
+    alex.move_item(pictures.id, garden.id, "Pictures")
+        .await
+        .unwrap();
+    server.list(&server.alex).await;
+    let text = server.file_text(id).await;
+    assert!(text.contains("![](Garden/Pictures/Moved.jpg)\n"), "{text}");
+    let (status, _, _) = server
+        .raw(
+            &server.alex,
+            "GET",
+            &image_address(id, "Garden/Pictures/Moved.jpg"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn takes_only_pictures() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"body": "Milk"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    for name in ["page.svg", "notes.md", "noextension"] {
+        let (status, _, _) = server
+            .raw(
+                &server.alex,
+                "POST",
+                &format!("/notes/{id}/images?name={name}"),
+                PHOTO.to_vec(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn people_a_note_is_shared_with_see_its_images_and_nothing_else() {
+    let server = start().await;
+    let top = server.notes_folder(&server.alex).await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Trip", "body": "Bags"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let (path, line) = add_photo(&server, &server.alex, id, "a.jpg").await;
+    show_at_top(&server, &server.alex, id, &line).await;
+    server
+        .as_person(&server.alex)
+        .create_file(top, "Secret.jpg", PHOTO)
+        .await
+        .unwrap();
+
+    // Nobody else sees it before the note is shared.
+    let (status, _, _) = server
+        .raw(&server.sam, "GET", &image_address(id, &path), Vec::new())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    share_with_sam(&server, id, ShareLevel::Viewer).await;
+    let (status, _, bytes) = server
+        .raw(&server.sam, "GET", &image_address(id, &path), Vec::new())
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, PHOTO);
+    for other in ["Secret.jpg", "Trip.md"] {
+        let (status, _, _) = server
+            .raw(&server.sam, "GET", &image_address(id, other), Vec::new())
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{other}");
+    }
+    // The image isn't shared itself.
+    let shared = server.storage.shared_with(server.sam.id).await.unwrap();
+    assert_eq!(shared.len(), 1);
+
+    // A viewer can't add one. An editor can, and its owner stores it.
+    let (status, _, _) = server
+        .raw(
+            &server.sam,
+            "POST",
+            &format!("/notes/{id}/images?name=b.jpg"),
+            PHOTO.to_vec(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    share_with_sam(&server, id, ShareLevel::Editor).await;
+    let (path, _) = add_photo(&server, &server.sam, id, "b.jpg").await;
+    assert_eq!(path, "Trip 2.jpg");
+    let added = server
+        .storage
+        .find(top, vec!["Trip 2.jpg".into()])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(added.owner, server.alex.id);
+}
+
+#[tokio::test]
+async fn images_go_to_the_trash_with_their_note_unless_another_uses_them() {
+    let server = start().await;
+    let top = server.notes_folder(&server.alex).await;
+    let (_, first) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "First", "body": "One"})),
+        )
+        .await;
+    let first = first["id"].as_str().unwrap();
+    let (_, second) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Second", "body": "Two"})),
+        )
+        .await;
+    let second = second["id"].as_str().unwrap();
+    let (_, only) = add_photo(&server, &server.alex, first, "a.jpg").await;
+    let (_, both) = add_photo(&server, &server.alex, first, "b.jpg").await;
+    show_at_top(&server, &server.alex, first, &format!("{only}\n{both}")).await;
+    show_at_top(&server, &server.alex, second, &both).await;
+
+    let named = |name: &'static str| {
+        let storage = server.storage.clone();
+        async move { storage.find(top, vec![name.into()]).await.unwrap() }
+    };
+    assert!(named("First 1.jpg").await.is_some());
+
+    let (status, _) = server
+        .api(&server.alex, "DELETE", &format!("/notes/{first}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(named("First 1.jpg").await.is_none());
+    assert!(named("First 2.jpg").await.is_some());
+
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/trash/{first}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let photo = named("First 1.jpg").await.unwrap();
+
+    server
+        .api(&server.alex, "DELETE", &format!("/notes/{first}"), None)
+        .await;
+    let (status, _) = server
+        .api(&server.alex, "DELETE", &format!("/trash/{first}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(server.storage.item(photo.id).await.unwrap().is_none());
+    assert!(named("First 2.jpg").await.is_some());
+}
+
+#[tokio::test]
+async fn a_removed_image_goes_to_the_trash_once_nothing_shows_it() {
+    let server = start().await;
+    let top = server.notes_folder(&server.alex).await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Shop", "body": "Eggs"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let (path, line) = add_photo(&server, &server.alex, id, "a.jpg").await;
+    show_at_top(&server, &server.alex, id, &line).await;
+
+    // Still shown, so it stays.
+    let (status, _, _) = server
+        .raw(
+            &server.alex,
+            "DELETE",
+            &image_address(id, &path),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        server
+            .storage
+            .find(top, vec![path.clone()])
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (_, opened) = server
+        .api(&server.alex, "GET", &format!("/notes/{id}"), None)
+        .await;
+    server
+        .api(
+            &server.alex,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"base": opened["hash"], "body": "Eggs"})),
+        )
+        .await;
+    server
+        .raw(
+            &server.alex,
+            "DELETE",
+            &image_address(id, &path),
+            Vec::new(),
+        )
+        .await;
+    assert!(
+        server
+            .storage
+            .find(top, vec![path])
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -11,7 +11,7 @@ use accordion_core::live::Hint;
 use accordion_core::storage::{Access, Error, Item, ItemKind, Storage};
 use accordion_module::{ApiError, Authenticated, coedit};
 use accordion_types::{ItemId, UserId};
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post, put};
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::NotesState;
 use crate::format::NoteFormat;
+use crate::images::{self, ImageView, Images};
 use crate::note::{self, Details, NoteFile};
 use crate::reminders::{Invalid, REMINDERS, ReminderView, When};
 use crate::settings::NotesSettings;
@@ -35,6 +36,14 @@ pub(crate) fn routes(state: NotesState) -> Router {
         .route("/notes", get(list).post(create))
         .route("/notes/{id}", get(open).put(update).delete(trash))
         .route("/notes/{id}/live", get(live))
+        .route(
+            "/notes/{id}/images",
+            post(images::add_image).layer(DefaultBodyLimit::max(images::MAX_IMAGE)),
+        )
+        .route(
+            "/notes/{id}/image",
+            get(images::image).delete(images::remove_image),
+        )
         .route(
             "/notes/{id}/reminder",
             put(set_reminder).delete(remove_reminder),
@@ -80,6 +89,10 @@ struct NoteView {
     /// The reader's own reminder on it, if they set one. Nobody else's
     /// shows.
     reminder: Option<ReminderView>,
+    /// The images one of the reader's own notes shows, which move with it
+    /// in Notes. Empty for others' notes, whose images show through
+    /// `/notes/{id}/image` like anyone's.
+    images: Vec<ImageView>,
 }
 
 #[derive(Clone, Serialize)]
@@ -130,6 +143,7 @@ impl NoteView {
             owner: Some(owner),
             access: access_name(access),
             reminder: None,
+            images: Vec::new(),
         }
     }
 
@@ -151,6 +165,7 @@ impl NoteView {
             created_at: indexed.created_at,
             modified_at: indexed.modified_at,
             reminder: None,
+            images: Vec::new(),
         }
     }
 }
@@ -186,7 +201,7 @@ struct ListQuery {
 
 /// Storage acting as the signed-in person, so their changes are recorded
 /// as theirs.
-fn by(state: &NotesState, me: &SignedIn) -> Storage {
+pub(crate) fn by(state: &NotesState, me: &SignedIn) -> Storage {
     state.storage.acting_as(accordion_module::auth::actor(me))
 }
 
@@ -292,12 +307,16 @@ impl<'a> People<'a> {
 
 /// A note the signed-in person can reach: their own, or one shared with
 /// them.
-enum Reached {
+pub(crate) enum Reached {
     Own { item: Item, top: ItemId },
     Others { item: Item, access: Access },
 }
 
-async fn reach(state: &NotesState, me: &SignedIn, id: ItemId) -> Result<Reached, ApiError> {
+pub(crate) async fn reach(
+    state: &NotesState,
+    me: &SignedIn,
+    id: ItemId,
+) -> Result<Reached, ApiError> {
     let top = ready(state, me).await?;
     let item = state
         .storage
@@ -325,8 +344,12 @@ async fn own_view(
     let sharing = Sharing::of(state, me.user.id, top).await?;
     let shared = sharing.covers(indexed.id, indexed.folder);
     let reminder = state.reminders.get(me.user.id, item.id).await?;
+    let images = Images::of(state, me.user.id, top)
+        .await?
+        .views(indexed.id, indexed.folder);
     Ok(NoteView {
         shared,
+        images,
         reminder: reminder.as_ref().map(ReminderView::from),
         ..NoteView::new(indexed, file.body().to_owned(), top)
     })
@@ -404,6 +427,7 @@ async fn list(
         .map(str::to_lowercase)
         .collect();
     let sharing = Sharing::of(&state, me.user.id, top).await?;
+    let images = Images::of(&state, me.user.id, top).await?;
     let mut notes: Vec<NoteView> = state
         .store
         .all(me.user.id)
@@ -425,6 +449,7 @@ async fn list(
             NoteView {
                 titled,
                 shared,
+                images: images.views(indexed.id, indexed.folder),
                 ..NoteView::new(indexed, body, top)
             }
         })
@@ -432,7 +457,12 @@ async fn list(
     if within.is_none() {
         let mut choices = state.shared.choices(me.user.id).await?;
         let mut people = People::new(&state);
+        let mut followed = HashSet::new();
         for (item, access) in state.shared.notes(me.user.id).await? {
+            // Links in others' notes follow images that moved since.
+            if followed.insert(item.owner) {
+                images::owner_place(&state, item.owner).await?;
+            }
             let text = state.store.read(item.id).await?;
             let mine = choices.remove(&item.id).unwrap_or_default();
             let body = NoteFile::parse(&text).body().to_owned();
@@ -757,6 +787,8 @@ async fn trash(
 ) -> Result<StatusCode, ApiError> {
     let folder = ready(&state, &me).await?;
     own_note(&state, me.user.id, folder, id).await?;
+    state.coediting.save_now(id).await;
+    images::trash_with(&state, &me, folder, id).await?;
     by(&state, &me).delete(id).await?;
     state.store.remove(id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -841,6 +873,7 @@ async fn restore(
     let folder = ready(&state, &me).await?;
     trashed_note(&state, me.user.id, folder, id).await?;
     let item = by(&state, &me).restore(id).await?;
+    images::restore_with(&state, &me, id).await?;
     let indexed = state.store.add(me.user.id, &item).await?;
     let file = NoteFile::parse(&state.store.read(id).await?);
     Ok(Json(NoteView::new(indexed, file.body().to_owned(), folder)))
@@ -855,6 +888,7 @@ async fn delete_forever(
     let folder = ready(&state, &me).await?;
     trashed_note(&state, me.user.id, folder, id).await?;
     by(&state, &me).delete_forever(id).await?;
+    images::delete_with(&state, &me, id).await?;
     state.reminders.forget(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -869,6 +903,7 @@ async fn empty_trash(
     let storage = by(&state, &me);
     for item in trashed_notes(&state, me.user.id, folder).await? {
         storage.delete_forever(item.id).await?;
+        images::delete_with(&state, &me, item.id).await?;
         state.reminders.forget(item.id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
