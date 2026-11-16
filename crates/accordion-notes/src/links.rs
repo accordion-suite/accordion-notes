@@ -35,6 +35,26 @@ pub fn image_extension(name: &str) -> Option<String> {
         .then_some(extension)
 }
 
+/// The kinds of sound Notes plays, by extension: what browsers record
+/// voice memos as (WebM, MP4 as `.m4a`, and Ogg), and what else they play,
+/// such as a memo Obsidian recorded.
+pub const SOUND_EXTENSIONS: [&str; 7] = ["webm", "m4a", "ogg", "opus", "mp3", "wav", "flac"];
+
+/// The extension of `name`, in lowercase, if it's a sound Notes plays.
+pub fn sound_extension(name: &str) -> Option<String> {
+    let (_, extension) = name.rsplit_once('.')?;
+    let extension = extension.to_ascii_lowercase();
+    SOUND_EXTENSIONS
+        .contains(&extension.as_str())
+        .then_some(extension)
+}
+
+/// The extension of `name` if it's a picture or a sound, which a note
+/// shows at its top and which go where the note goes.
+pub fn media_extension(name: &str) -> Option<String> {
+    image_extension(name).or_else(|| sound_extension(name))
+}
+
 /// Every link to a file in `text`, in order.
 pub fn links(text: &str) -> Vec<Link> {
     let mut found = Vec::new();
@@ -251,7 +271,7 @@ pub fn encode(path: &str) -> String {
     out
 }
 
-/// The line that shows an image, for the top of a note.
+/// The line that shows an image or plays a memo, for the top of a note.
 pub fn image_line(path: &str) -> String {
     format!("![]({})", encode(path))
 }
@@ -340,5 +360,10 @@ mod tests {
         assert_eq!(image_extension("A.JPG").as_deref(), Some("jpg"));
         assert_eq!(image_extension("a.svg"), None);
         assert_eq!(image_extension("noextension"), None);
+        assert_eq!(sound_extension("Memo.M4A").as_deref(), Some("m4a"));
+        assert_eq!(sound_extension("a.jpg"), None);
+        assert_eq!(media_extension("a.webm").as_deref(), Some("webm"));
+        assert_eq!(media_extension("a.png").as_deref(), Some("png"));
+        assert_eq!(media_extension("a.pdf"), None);
     }
 }

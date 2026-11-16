@@ -41,6 +41,10 @@ pub(crate) fn routes(state: NotesState) -> Router {
             post(images::add_image).layer(DefaultBodyLimit::max(images::MAX_IMAGE)),
         )
         .route(
+            "/notes/{id}/memos",
+            post(images::add_memo).layer(DefaultBodyLimit::max(images::MAX_IMAGE)),
+        )
+        .route(
             "/notes/{id}/image",
             get(images::image).delete(images::remove_image),
         )

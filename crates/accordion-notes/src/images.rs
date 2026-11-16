@@ -1,8 +1,8 @@
-//! Images in notes (decision 31): each one a file beside its note, linked
-//! by its path from the top of the Notes place.
+//! Images and voice memos in notes (decisions 31 and 33): each one a file
+//! beside its note, linked by its path from the top of the Notes place.
 //!
-//! Notes serves a note's images to everyone who can open the note, so the
-//! images are never shared themselves. It serves only files the note links
+//! Notes serves a note's images and memos to everyone who can open the
+//! note, so they're never shared themselves. It serves only files the note links
 //! to, from its owner's Notes place, so a link can't reach anything else.
 
 use std::collections::{HashMap, HashSet};
@@ -15,22 +15,28 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-    X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, ETAG, IF_NONE_MATCH, IF_RANGE, RANGE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::NotesState;
 use crate::api::{Reached, by, reach};
-use crate::links::{self, image_extension};
+use crate::links::{self, image_extension, media_extension, sound_extension};
 use crate::note::{self, NoteFile};
 use crate::store::{Beside, NoteLink, path_text};
 
-/// The largest picture Notes takes.
+/// The largest picture or voice memo Notes takes. A 30-minute memo at the
+/// 64 kbit/s the app records at is about 15 MB.
 pub(crate) const MAX_IMAGE: usize = 50 * 1024 * 1024;
+
+/// The most of a memo sent for a request that asks for everything from a
+/// point on, as players do, so playing a long memo never reads it whole
+/// into memory. Players ask again for the rest.
+const MOST_AT_ONCE: u64 = 2 * 1024 * 1024;
 
 /// The files in someone's Notes place, found by path and by name.
 pub(crate) struct Files {
@@ -115,8 +121,8 @@ async fn dir_of(state: &NotesState, top: ItemId, item: &Item) -> Result<String, 
         .unwrap_or_default())
 }
 
-/// An image of one of the reader's own notes, which moves with the note
-/// when it moves in Notes.
+/// An image or memo of one of the reader's own notes, which moves with the
+/// note when it moves in Notes.
 #[derive(Clone, Serialize)]
 pub(crate) struct ImageView {
     id: ItemId,
@@ -125,14 +131,14 @@ pub(crate) struct ImageView {
     beside: bool,
 }
 
-/// The images a note shows, as files, in the order it shows them.
+/// The images and memos a note shows, as files, in the order it shows them.
 fn images_of<'a>(files: &'a Files, dir: &str, links: &[NoteLink]) -> Vec<&'a Beside> {
     let mut seen = HashSet::new();
     links
         .iter()
         .filter(|link| link.embed)
         .filter_map(|link| files.resolve(dir, &link.target))
-        .filter(|file| image_extension(&file.path).is_some() && seen.insert(file.id))
+        .filter(|file| media_extension(&file.path).is_some() && seen.insert(file.id))
         .collect()
 }
 
@@ -328,7 +334,7 @@ async fn links_to(state: &NotesState, id: ItemId, target: &str) -> Result<bool, 
 fn not_found() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
-        "This picture isn't in Notes anymore. It may have been moved out of the Notes folder or deleted.",
+        "This picture or memo isn't in Notes anymore. It may have been moved out of the Notes folder or deleted.",
     )
 }
 
@@ -340,9 +346,9 @@ pub(crate) struct ImageQuery {
     size: Option<String>,
 }
 
-/// `GET /notes/{id}/image?path=…`: one of the note's images, for anyone
-/// who can open the note. `size=small` sends Drive's thumbnail when there
-/// is one.
+/// `GET /notes/{id}/image?path=…`: one of the note's images or memos, for
+/// anyone who can open the note. `size=small` sends Drive's thumbnail of a
+/// picture when there is one. A memo comes in parts when the player asks.
 pub(crate) async fn image(
     State(state): State<NotesState>,
     Authenticated(me): Authenticated,
@@ -362,7 +368,8 @@ pub(crate) async fn image(
     let dir = dir_of(&state, top, &item).await?;
     let files = Files::of(&state, item.owner).await?;
     let file = files.resolve(&dir, &query.path).ok_or_else(not_found)?;
-    let Some(extension) = image_extension(&file.path) else {
+    let sound = sound_extension(&file.path);
+    let Some(extension) = image_extension(&file.path).or(sound.clone()) else {
         return Err(not_found());
     };
     let file = state
@@ -374,6 +381,17 @@ pub(crate) async fn image(
     let ItemKind::File { blob, .. } = &file.kind else {
         return Err(not_found());
     };
+    if let Some(extension) = sound {
+        return send_sound(
+            &state,
+            &request,
+            file.id,
+            blob.size,
+            blob.hash.to_hex(),
+            &extension,
+        )
+        .await;
+    }
     let small = query.size.as_deref() == Some("small");
     let tag = format!(
         "\"{}-{}\"",
@@ -445,6 +463,138 @@ fn shown_as(extension: &str) -> Option<&'static str> {
     })
 }
 
+/// The media type of a sound Notes plays.
+fn played_as(extension: &str) -> &'static str {
+    match extension {
+        "webm" => "audio/webm",
+        "m4a" => "audio/mp4",
+        "ogg" | "opus" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Sends a memo, or the part of it a `Range` header asks for. Players ask
+/// for parts to skip ahead, and Safari plays nothing without them. This
+/// follows Drive's downloads, which serve ranges the same way.
+async fn send_sound(
+    state: &NotesState,
+    request: &HeaderMap,
+    id: ItemId,
+    size: u64,
+    hash: String,
+    extension: &str,
+) -> Result<Response, ApiError> {
+    let tag = format!("\"{hash}\"");
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(played_as(extension)));
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&tag).expect("hex is a valid header"),
+    );
+    let asked = match requested_range(request, size, &tag) {
+        Ok(asked) => asked,
+        Err(Unsatisfiable) => {
+            headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::try_from(format!("bytes */{size}")).expect("digits are valid"),
+            );
+            return Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
+        }
+    };
+    if asked.is_none()
+        && request
+            .get(IF_NONE_MATCH)
+            .is_some_and(|wanted| wanted.as_bytes() == tag.as_bytes())
+    {
+        return Ok((StatusCode::NOT_MODIFIED, headers).into_response());
+    }
+    let range = match &asked {
+        Some(asked) => asked.start..asked.end.min(asked.start + MOST_AT_ONCE),
+        None => 0..size,
+    };
+    let mut file = state.storage.open_file(id).await?;
+    file.seek(std::io::SeekFrom::Start(range.start))
+        .await
+        .map_err(Error::Io)?;
+    let mut bytes = Vec::new();
+    file.take(range.end - range.start)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(Error::Io)?;
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    if asked.is_none() {
+        return Ok((headers, bytes).into_response());
+    }
+    headers.insert(
+        CONTENT_RANGE,
+        HeaderValue::try_from(format!("bytes {}-{}/{size}", range.start, range.end - 1))
+            .expect("digits are valid"),
+    );
+    Ok((StatusCode::PARTIAL_CONTENT, headers, bytes).into_response())
+}
+
+/// A `Range` header that asks only for bytes past the end of the file.
+#[derive(Debug, PartialEq, Eq)]
+struct Unsatisfiable;
+
+/// The bytes a `Range` header asks for, out of a file of `size` bytes with
+/// `etag`, as Drive reads them. `None` means the whole file: there's no
+/// header, or one this doesn't serve, such as several ranges at once, or
+/// an `If-Range` for an older version (RFC 9110, section 14).
+fn requested_range(
+    request: &HeaderMap,
+    size: u64,
+    etag: &str,
+) -> Result<Option<std::ops::Range<u64>>, Unsatisfiable> {
+    let Some(spec) = request
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().strip_prefix("bytes="))
+    else {
+        return Ok(None);
+    };
+    if request
+        .get(IF_RANGE)
+        .is_some_and(|value| value.as_bytes() != etag.as_bytes())
+    {
+        return Ok(None);
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return Ok(None);
+    };
+    let number = |text: &str| text.trim().parse::<u64>().ok();
+    let range = match (first.trim().is_empty(), last.trim().is_empty()) {
+        // "-500": the last 500 bytes.
+        (true, false) => match number(last) {
+            Some(0) => return Err(Unsatisfiable),
+            Some(count) => size.saturating_sub(count)..size,
+            None => return Ok(None),
+        },
+        // "500-": from byte 500 to the end.
+        (false, true) => match number(first) {
+            Some(start) => start..size,
+            None => return Ok(None),
+        },
+        // "500-999", which includes byte 999.
+        (false, false) => match (number(first), number(last)) {
+            (Some(start), Some(end)) if end >= start => start..size.min(end + 1),
+            _ => return Ok(None),
+        },
+        (true, true) => return Ok(None),
+    };
+    if range.start >= size {
+        return Err(Unsatisfiable);
+    }
+    Ok(Some(range))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct NewImage {
     /// The picture's own file name, for its extension.
@@ -481,8 +631,6 @@ pub(crate) async fn add_image(
     Query(request): Query<NewImage>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<AddedImage>), ApiError> {
-    let (item, top, access) = note_and_place(&state, &me, id).await?;
-    may_edit(access)?;
     let Some(extension) = image_extension(&request.name) else {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -495,12 +643,57 @@ pub(crate) async fn add_image(
             "This picture is empty. Choose another one.",
         ));
     }
+    save_beside(&state, &me, id, &extension, &body).await
+}
+
+/// What browsers record voice memos as.
+const RECORDED_EXTENSIONS: [&str; 3] = ["webm", "m4a", "ogg"];
+
+/// `POST /notes/{id}/memos?name=…`: saves a voice memo recorded in Notes
+/// beside the note, as `add_image` saves a picture. Only memos recorded
+/// in Notes come this way, which is how Notes will know which ones to
+/// transcribe (decision 33).
+pub(crate) async fn add_memo(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+    Query(request): Query<NewImage>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<AddedImage>), ApiError> {
+    let extension = sound_extension(&request.name)
+        .filter(|extension| RECORDED_EXTENSIONS.contains(&extension.as_str()))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Notes saves voice memos as WebM, MP4, or Ogg sound, which this isn't.",
+            )
+        })?;
+    if body.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "This memo has no sound in it. Record it again.",
+        ));
+    }
+    save_beside(&state, &me, id, &extension, &body).await
+}
+
+/// Saves a file beside the note `id`, named after it and numbered, and
+/// replies with the line that shows or plays it.
+async fn save_beside(
+    state: &NotesState,
+    me: &SignedIn,
+    id: ItemId,
+    extension: &str,
+    body: &[u8],
+) -> Result<(StatusCode, Json<AddedImage>), ApiError> {
+    let (item, top, access) = note_and_place(state, me, id).await?;
+    may_edit(access)?;
     let parent = item.parent.ok_or(Error::NotAFile)?;
     let title = note::title_of(&item.name);
-    let storage = by(&state, &me);
-    // Numbered past every picture of the note's already there, whatever
-    // its kind, so `Groceries 1.jpg` and `Groceries 1.png` aren't both
-    // beside it.
+    let storage = by(state, me);
+    // Numbered past every file of the note's already there, whatever its
+    // kind, so `Groceries 1.jpg` and `Groceries 1.webm` aren't both beside
+    // it.
     let taken: HashSet<String> = state
         .storage
         .children(parent)
@@ -517,7 +710,7 @@ pub(crate) async fn add_image(
             continue;
         }
         let name = format!("{title} {number}.{extension}");
-        match storage.create_file(parent, &name, body.as_ref()).await {
+        match storage.create_file(parent, &name, body).await {
             Err(Error::NameTaken { .. }) => continue,
             result => {
                 saved = Some(result?);
@@ -532,7 +725,7 @@ pub(crate) async fn add_image(
         .await?
         .map(|path| path_text(&path))
         .ok_or_else(not_found)?;
-    // So the image is found by its path straight away.
+    // So the file is found by its path straight away.
     state.store.follow(item.owner, top).await?;
     Ok((
         StatusCode::CREATED,
@@ -543,8 +736,8 @@ pub(crate) async fn add_image(
     ))
 }
 
-/// `DELETE /notes/{id}/image?path=…`: after the app took the image out of
-/// the note, moves it to the trash, unless the note or another of its
+/// `DELETE /notes/{id}/image?path=…`: after the app took an image or memo
+/// out of the note, moves its file to the trash, unless the note or another of its
 /// owner's notes still uses it.
 pub(crate) async fn remove_image(
     State(state): State<NotesState>,
@@ -563,7 +756,7 @@ pub(crate) async fn remove_image(
     let Some(file) = images.files.resolve(&dir, &query.path).cloned() else {
         return Ok(StatusCode::NO_CONTENT);
     };
-    if image_extension(&file.path).is_none() {
+    if media_extension(&file.path).is_none() {
         return Ok(StatusCode::NO_CONTENT);
     }
     let folders = note_folders(&state, item.owner).await?;

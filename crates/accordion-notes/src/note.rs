@@ -471,11 +471,13 @@ const TITLE_CHARS: usize = 100;
 /// How much of the first line names a note without a title.
 const DERIVED_CHARS: usize = 40;
 
-/// The name a note without a title gets: its first words.
+/// The name a note without a title gets: its first words. The pictures and
+/// memos at its top aren't words, so a note of only those is untitled.
 pub fn derived_title(body: &str) -> String {
     let line = body
         .lines()
         .map(str::trim)
+        .filter(|line| !only_shows_a_file(line))
         .map(strip_markers)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
@@ -492,6 +494,19 @@ pub fn derived_title(body: &str) -> String {
         Some(at) if at > 0 => cut[..at].trim_end().to_owned(),
         _ => cut,
     }
+}
+
+/// Whether a line does nothing but show a picture or play a memo, such as
+/// `![](Garden/Groceries%201.jpg)` or `![[memo.webm]]`.
+fn only_shows_a_file(line: &str) -> bool {
+    let line = line.trim();
+    if !line.starts_with("![") || !(line.ends_with(')') || line.ends_with("]]")) {
+        return false;
+    }
+    matches!(
+        crate::links::links(line).as_slice(),
+        [link] if link.embed && crate::links::media_extension(&link.target).is_some()
+    )
 }
 
 /// A line without Markdown's list, checkbox, heading, and quote markers,
@@ -574,6 +589,22 @@ pub fn has_title(name: &str, body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_a_note_after_words_not_its_pictures_or_memos() {
+        assert_eq!(
+            derived_title("![](Untitled%20note%201.webm)\n"),
+            "Untitled note"
+        );
+        assert_eq!(
+            derived_title("![](Trip%201.jpg)\n![[Trip 2.webm]]\n\nBags to pack\n"),
+            "Bags to pack"
+        );
+        // A picture with words beside it, or a link to something else, is
+        // words.
+        assert_eq!(derived_title("![](a.jpg) Sunset\n"), "![](a.jpg) Sunset");
+        assert_eq!(derived_title("![](plan.pdf)\n"), "![](plan.pdf)");
+    }
 
     #[test]
     fn reads_a_note_without_front_matter() {

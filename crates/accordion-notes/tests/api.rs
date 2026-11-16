@@ -162,12 +162,26 @@ impl Server {
         path: &str,
         body: Vec<u8>,
     ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
-        let request = Request::builder()
+        self.raw_with(person, method, path, body, &[]).await
+    }
+
+    /// Like `raw`, with headers of its own, such as `Range`.
+    async fn raw_with(
+        &self,
+        person: &Person,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::builder()
             .method(method)
             .uri(format!("/api/notes{path}"))
-            .header("authorization", &person.bearer)
-            .body(Body::from(body))
-            .unwrap();
+            .header("authorization", &person.bearer);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(Body::from(body)).unwrap();
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
@@ -1613,6 +1627,106 @@ async fn a_removed_image_goes_to_the_trash_once_nothing_shows_it() {
         server
             .storage
             .find(top, vec![path])
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn voice_memos_go_beside_their_note_and_play_in_parts() {
+    let server = start().await;
+    let top = server.notes_folder(&server.alex).await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Trip", "body": "Bags"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let sound: Vec<u8> = (0..5000u32).map(|n| (n % 251) as u8).collect();
+
+    // Only what browsers record comes this way.
+    for name in ["memo.mp3", "memo.jpg", "memo"] {
+        let (status, _, _) = server
+            .raw(
+                &server.alex,
+                "POST",
+                &format!("/notes/{id}/memos?name={name}"),
+                sound.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+    }
+
+    let (status, _, body) = server
+        .raw(
+            &server.alex,
+            "POST",
+            &format!("/notes/{id}/memos?name=memo.webm"),
+            sound.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let added: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(added["path"], "Trip 1.webm");
+    assert_eq!(added["line"], "![](Trip%201.webm)");
+    // Pictures number on past it.
+    let (path, _) = add_photo(&server, &server.alex, id, "a.jpg").await;
+    assert_eq!(path, "Trip 2.jpg");
+    show_at_top(&server, &server.alex, id, "![](Trip%201.webm)").await;
+
+    let address = image_address(id, "Trip 1.webm");
+    let (status, headers, whole) = server.raw(&server.alex, "GET", &address, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/webm");
+    assert_eq!(headers["accept-ranges"], "bytes");
+    assert_eq!(whole, sound);
+
+    let (status, headers, part) = server
+        .raw_with(
+            &server.alex,
+            "GET",
+            &address,
+            Vec::new(),
+            &[("range", "bytes=100-199")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers["content-range"], "bytes 100-199/5000");
+    assert_eq!(part, sound[100..200]);
+
+    let (status, headers, _) = server
+        .raw_with(
+            &server.alex,
+            "GET",
+            &address,
+            Vec::new(),
+            &[("range", "bytes=6000-")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(headers["content-range"], "bytes */5000");
+
+    // The memo goes to the trash with its note.
+    let (_, listed) = server.api(&server.alex, "GET", "/notes", None).await;
+    let shown = listed["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|note| note["id"] == id)
+        .unwrap()["images"]
+        .clone();
+    assert_eq!(shown[0]["name"], "Trip 1.webm");
+    server
+        .api(&server.alex, "DELETE", &format!("/notes/{id}"), None)
+        .await;
+    assert!(
+        server
+            .storage
+            .find(top, vec!["Trip 1.webm".into()])
             .await
             .unwrap()
             .is_none()
