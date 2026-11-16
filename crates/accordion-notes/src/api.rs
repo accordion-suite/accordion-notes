@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use accordion_core::identity::SignedIn;
+use accordion_core::live::Hint;
 use accordion_core::storage::{Access, Error, Item, ItemKind, Storage};
 use accordion_module::{ApiError, Authenticated, coedit};
 use accordion_types::{ItemId, UserId};
@@ -15,11 +16,13 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::NotesState;
 use crate::format::NoteFormat;
 use crate::note::{self, Details, NoteFile};
+use crate::reminders::{Invalid, REMINDERS, ReminderView, When};
 use crate::settings::NotesSettings;
 use crate::shared::Choices;
 use crate::store::{Indexed, shorten};
@@ -32,6 +35,12 @@ pub(crate) fn routes(state: NotesState) -> Router {
         .route("/notes", get(list).post(create))
         .route("/notes/{id}", get(open).put(update).delete(trash))
         .route("/notes/{id}/live", get(live))
+        .route(
+            "/notes/{id}/reminder",
+            put(set_reminder).delete(remove_reminder),
+        )
+        .route("/notes/{id}/reminder/snooze", post(snooze_reminder))
+        .route("/notes/{id}/reminder/done", post(finish_reminder))
         .route("/trash", get(trashed).delete(empty_trash))
         .route("/trash/{id}", axum::routing::delete(delete_forever))
         .route("/trash/{id}/restore", post(restore))
@@ -68,6 +77,9 @@ struct NoteView {
     owner: Option<PersonView>,
     /// `owner`, `editor`, or `viewer`.
     access: &'static str,
+    /// The reader's own reminder on it, if they set one. Nobody else's
+    /// shows.
+    reminder: Option<ReminderView>,
 }
 
 #[derive(Clone, Serialize)]
@@ -117,6 +129,7 @@ impl NoteView {
             shared: true,
             owner: Some(owner),
             access: access_name(access),
+            reminder: None,
         }
     }
 
@@ -137,6 +150,7 @@ impl NoteView {
             hash: indexed.hash,
             created_at: indexed.created_at,
             modified_at: indexed.modified_at,
+            reminder: None,
         }
     }
 }
@@ -310,8 +324,10 @@ async fn own_view(
     let file = NoteFile::parse(&state.store.read(item.id).await?);
     let sharing = Sharing::of(state, me.user.id, top).await?;
     let shared = sharing.covers(indexed.id, indexed.folder);
+    let reminder = state.reminders.get(me.user.id, item.id).await?;
     Ok(NoteView {
         shared,
+        reminder: reminder.as_ref().map(ReminderView::from),
         ..NoteView::new(indexed, file.body().to_owned(), top)
     })
 }
@@ -332,7 +348,11 @@ async fn others_view(
         .remove(&item.id)
         .unwrap_or_default();
     let owner = People::new(state).get(item.owner).await?;
-    Ok(NoteView::others(item, access, &text, body, choices, owner))
+    let reminder = state.reminders.get(me.user.id, item.id).await?;
+    Ok(NoteView {
+        reminder: reminder.as_ref().map(ReminderView::from),
+        ..NoteView::others(item, access, &text, body, choices, owner)
+    })
 }
 
 /// The folders in the Notes place, and the ones inside `folder`, counting
@@ -424,6 +444,10 @@ async fn list(
             notes.push(NoteView::others(&item, access, &text, short, mine, owner));
         }
         notes.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    }
+    let reminders = state.reminders.of(me.user.id).await?;
+    for note in &mut notes {
+        note.reminder = reminders.get(&note.id).map(ReminderView::from);
     }
     let folders = all_folders
         .into_iter()
@@ -831,6 +855,7 @@ async fn delete_forever(
     let folder = ready(&state, &me).await?;
     trashed_note(&state, me.user.id, folder, id).await?;
     by(&state, &me).delete_forever(id).await?;
+    state.reminders.forget(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -844,6 +869,7 @@ async fn empty_trash(
     let storage = by(&state, &me);
     for item in trashed_notes(&state, me.user.id, folder).await? {
         storage.delete_forever(item.id).await?;
+        state.reminders.forget(item.id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1017,4 +1043,123 @@ async fn remove_label(
     Ok(Json(LabelsView {
         labels: all_labels(&state, me.user.id).await?,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewReminder {
+    /// The clock time, such as `2026-11-20T09:00`.
+    local: String,
+    /// The browser's time zone, such as `Europe/Amsterdam`.
+    zone: String,
+    /// `daily`, `weekly`, `monthly`, or `yearly`. Leave it out for once.
+    repeat: Option<String>,
+}
+
+fn invalid_reminder(invalid: Invalid) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        match invalid {
+            Invalid::Time => "Pick a date and time for the reminder.",
+            Invalid::Zone => {
+                "Accordion doesn't recognize this device's time zone. Check the time zone in \
+                 its settings, then try again."
+            }
+            Invalid::Repeat => "A reminder can repeat daily, weekly, monthly, or yearly.",
+        },
+    )
+}
+
+/// Tells the person's other tabs that their reminders changed.
+fn reminders_changed(state: &NotesState, user: UserId) {
+    state.live.send(Hint::person(REMINDERS, user));
+}
+
+/// `PUT /notes/{id}/reminder`: sets the signed-in person's own reminder on
+/// a note they can open, a viewer's too, in place of any they had.
+async fn set_reminder(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+    Json(request): Json<NewReminder>,
+) -> Result<Json<ReminderView>, ApiError> {
+    reach(&state, &me, id).await?;
+    let when = When::parse(&request.local, &request.zone, request.repeat.as_deref())
+        .map_err(invalid_reminder)?;
+    let reminder = state
+        .reminders
+        .set(me.user.id, id, when, Timestamp::now())
+        .await?
+        .ok_or_else(|| invalid_reminder(Invalid::Time))?;
+    reminders_changed(&state, me.user.id);
+    Ok(Json(ReminderView::from(&reminder)))
+}
+
+/// `DELETE /notes/{id}/reminder`: takes the person's reminder off a note.
+async fn remove_reminder(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+) -> Result<StatusCode, ApiError> {
+    reach(&state, &me, id).await?;
+    if state.reminders.remove(me.user.id, id).await? {
+        reminders_changed(&state, me.user.id);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snooze {
+    /// When to ring again, such as `2026-11-20T17:00:00Z`.
+    until: String,
+}
+
+/// The furthest ahead a snooze goes.
+const SNOOZE_AT_MOST: i64 = 366 * 86_400;
+
+/// `POST /notes/{id}/reminder/snooze`: rings the person's reminder again
+/// later. One that repeats carries on from its own times after that.
+async fn snooze_reminder(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+    Json(request): Json<Snooze>,
+) -> Result<Json<ReminderView>, ApiError> {
+    reach(&state, &me, id).await?;
+    let now = Timestamp::now();
+    let until: Timestamp = request
+        .until
+        .parse()
+        .ok()
+        .filter(|until: &Timestamp| {
+            *until > now && until.as_second() - now.as_second() <= SNOOZE_AT_MOST
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Pick a time later today or within the next year to snooze until.",
+            )
+        })?;
+    let reminder = state
+        .reminders
+        .snooze(me.user.id, id, until)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    reminders_changed(&state, me.user.id);
+    Ok(Json(ReminderView::from(&reminder)))
+}
+
+/// `POST /notes/{id}/reminder/done`: finishes the person's reminder. One
+/// that doesn't repeat goes, and one that does waits for its next time.
+/// Replies with what's left, or null.
+async fn finish_reminder(
+    State(state): State<NotesState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+) -> Result<Json<Option<ReminderView>>, ApiError> {
+    reach(&state, &me, id).await?;
+    let left = state.reminders.done(me.user.id, id).await?;
+    reminders_changed(&state, me.user.id);
+    Ok(Json(left.as_ref().map(ReminderView::from)))
 }

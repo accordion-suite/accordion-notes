@@ -6,10 +6,12 @@
 //! and open in Obsidian or any editor. What the
 //! cards show (color, pin, labels, archive) is in each file's front matter,
 //! and Notes keeps an index of it in its own tables so lists are quick.
+//! Reminders are each person's own, in Notes' tables only.
 
 mod api;
 mod format;
 pub mod note;
+mod reminders;
 mod settings;
 mod shared;
 mod store;
@@ -17,6 +19,7 @@ mod store;
 use accordion_core::coedit::CoEditing;
 use accordion_core::db::Migration;
 use accordion_core::identity::Identity;
+use accordion_core::live::Live;
 use accordion_core::storage::Storage;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
 use axum::extract::FromRef;
@@ -30,6 +33,7 @@ static MIGRATIONS: &[Migration] = &[
     store::MIGRATION_2,
     settings::MIGRATION,
     shared::MIGRATION,
+    reminders::MIGRATION,
 ];
 
 /// The Notes module. Add it to the server's list of modules.
@@ -60,12 +64,21 @@ impl Module for Notes {
     fn start(
         &self,
         services: Services,
-        _stopping: Stopping,
+        stopping: Stopping,
     ) -> BoxFuture<Result<Started, StartError>> {
         Box::pin(async move {
             services.db.migrate(OWNER, MIGRATIONS).await?;
             services.storage.add_place(store::PLACE);
+            let reminders = reminders::Reminders::new(services.db.clone());
+            let ringer = reminders::Ringer {
+                reminders: reminders.clone(),
+                storage: services.storage.clone(),
+                events: services.events.clone(),
+                live: services.live.clone(),
+            };
             let state = NotesState {
+                reminders,
+                live: services.live,
                 store: store::Store::new(services.db.clone(), services.storage.clone()),
                 shared: shared::Shared::new(services.db.clone(), services.storage.clone()),
                 settings: settings::Settings::new(services.db),
@@ -78,7 +91,7 @@ impl Module for Notes {
                     api: Some(api::routes(state)),
                     ..Routes::default()
                 },
-                background: None,
+                background: Some(Box::pin(ringer.run(stopping))),
             })
         })
     }
@@ -91,6 +104,8 @@ struct NotesState {
     store: store::Store,
     shared: shared::Shared,
     settings: settings::Settings,
+    reminders: reminders::Reminders,
+    live: Live,
     coediting: CoEditing,
 }
 

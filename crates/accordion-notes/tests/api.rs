@@ -1096,3 +1096,165 @@ mod live {
         assert_eq!(server.file_text(&id).await, "Read me");
     }
 }
+
+#[tokio::test]
+async fn reminders_are_each_persons_own_and_stay_out_of_the_file() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Groceries", "body": "Milk"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap().to_owned();
+    let before = server.file_text(&id).await;
+    let path = format!("/notes/{id}/reminder");
+
+    // Nobody sets a reminder on a note they can't open.
+    let monday =
+        json!({"local": "2030-03-25T09:00", "zone": "Europe/Amsterdam", "repeat": "weekly"});
+    let (status, _) = server
+        .api(&server.sam, "PUT", &path, Some(monday.clone()))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, set) = server.api(&server.alex, "PUT", &path, Some(monday)).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(set["local"], "2030-03-25T09:00");
+    assert_eq!(set["repeat"], "weekly");
+    // 09:00 in Amsterdam, which is in winter time that day.
+    assert_eq!(set["due_at"], "2030-03-25T08:00:00Z");
+    assert_eq!(set["rang"], false);
+    assert_eq!(server.file_text(&id).await, before);
+
+    // A viewer sets their own, and neither sees the other's.
+    share_with_sam(&server, &id, ShareLevel::Viewer).await;
+    assert_eq!(
+        find(&server.list(&server.sam).await, &id).unwrap()["reminder"],
+        Value::Null
+    );
+    let (status, sams) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &path,
+            Some(json!({"local": "2030-01-02T18:30", "zone": "UTC"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sams}");
+    assert_eq!(
+        find(&server.list(&server.sam).await, &id).unwrap()["reminder"]["local"],
+        "2030-01-02T18:30"
+    );
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["reminder"]["local"],
+        "2030-03-25T09:00"
+    );
+    let (_, opened) = server
+        .api(&server.sam, "GET", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(opened["reminder"]["zone"], "UTC");
+    assert_eq!(server.file_text(&id).await, before);
+
+    // Snoozing moves only the person's own, and done takes a reminder that
+    // doesn't repeat away.
+    let until = in_two_hours();
+    let (status, snoozed) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("{path}/snooze"),
+            Some(json!({ "until": until })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{snoozed}");
+    assert_eq!(snoozed["due_at"], until);
+    assert_eq!(snoozed["local"], "2030-01-02T18:30");
+    let (status, left) = server
+        .api(&server.sam, "POST", &format!("{path}/done"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(left, Value::Null);
+    let (_, alexs_done) = server
+        .api(&server.alex, "POST", &format!("{path}/done"), None)
+        .await;
+    assert_eq!(alexs_done["repeat"], "weekly");
+
+    // Removed, it's gone for that person only.
+    let (status, _) = server.api(&server.alex, "DELETE", &path, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        find(&server.list(&server.alex).await, &id).unwrap()["reminder"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn a_reminder_needs_a_real_time_zone_and_a_later_snooze() {
+    let server = start().await;
+    let (_, note) = server
+        .api(&server.alex, "POST", "/notes", Some(json!({"body": "Vet"})))
+        .await;
+    let path = format!("/notes/{}/reminder", note["id"].as_str().unwrap());
+    let (status, problem) = server
+        .api(
+            &server.alex,
+            "PUT",
+            &path,
+            Some(json!({"local": "2030-01-02T18:30", "zone": "Nowhere/Here"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        problem["error"].as_str().unwrap().contains("time zone"),
+        "{problem}"
+    );
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "PUT",
+            &path,
+            Some(json!({"local": "tomorrow", "zone": "UTC"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Snoozing needs a reminder, and a time to come.
+    let snooze = format!("{path}/snooze");
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &snooze,
+            Some(json!({ "until": in_two_hours() })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    server
+        .api(
+            &server.alex,
+            "PUT",
+            &path,
+            Some(json!({"local": "2030-01-02T18:30", "zone": "UTC"})),
+        )
+        .await;
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &snooze,
+            Some(json!({"until": "2020-01-03T08:00:00Z"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Two hours from now, to the second, as the server writes times.
+fn in_two_hours() -> String {
+    let now = jiff::Timestamp::now().as_second();
+    jiff::Timestamp::from_second(now + 7_200)
+        .unwrap()
+        .to_string()
+}
