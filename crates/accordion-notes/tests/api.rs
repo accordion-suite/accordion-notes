@@ -997,6 +997,17 @@ mod live {
             }
         }
 
+        /// Takes in what the server sends until `name` reads `expected`.
+        async fn wait_for(&mut self, name: &str, expected: &str) {
+            for _ in 0..25 {
+                if self.text(name) == expected {
+                    return;
+                }
+                self.take_in().await;
+            }
+            assert_eq!(self.text(name), expected);
+        }
+
         fn text(&self, name: &str) -> String {
             let text = self.doc.get_or_insert_text(name);
             text.get_string(&self.doc.transact())
@@ -1045,8 +1056,11 @@ mod live {
         );
 
         // A change through the API lands on top of the typing, and reaches
-        // Sam's copy as edits.
+        // Sam's copy as edits. The server passes typing on only once it has
+        // it, so Alex seeing it means the change can't overtake it.
+        let mut alex = Browser::open(address, &server.alex, &id).await;
         sam.type_at_end(", bread").await;
+        alex.wait_for("body", "Milk and eggs, bread").await;
         let (status, changed) = server
             .api(
                 &server.alex,
