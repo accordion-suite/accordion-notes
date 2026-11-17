@@ -145,7 +145,7 @@ pub(crate) async fn folder_paths(
 }
 
 /// The path of the folder `item` is in, from the top of the place.
-async fn dir_of(state: &NotesState, top: ItemId, item: &Item) -> Result<String, Error> {
+pub(crate) async fn dir_of(state: &NotesState, top: ItemId, item: &Item) -> Result<String, Error> {
     let Some(parent) = item.parent else {
         return Ok(String::new());
     };
@@ -639,6 +639,8 @@ pub(crate) struct NewImage {
 
 #[derive(Serialize)]
 pub(crate) struct AddedImage {
+    #[serde(skip)]
+    id: ItemId,
     /// Its path from the top of the Notes place, for the link.
     path: String,
     /// The line that shows it, for the top of the note.
@@ -685,15 +687,24 @@ pub(crate) async fn add_image(
 /// What browsers record voice memos as.
 const RECORDED_EXTENSIONS: [&str; 3] = ["webm", "m4a", "ogg"];
 
-/// `POST /notes/{id}/memos?name=…`: saves a voice memo recorded in Notes
-/// beside the note, as `add_image` saves a picture. Only memos recorded
-/// in Notes come this way, which is how Notes will know which ones to
-/// transcribe (decision 33).
+#[derive(Deserialize)]
+pub(crate) struct NewMemo {
+    /// The memo's file name, for its extension.
+    name: String,
+    /// Whether the person who recorded it asked for a transcript.
+    #[serde(default)]
+    transcribe: bool,
+}
+
+/// `POST /notes/{id}/memos?name=…&transcribe=true`: saves a voice memo
+/// recorded in Notes beside the note, as `add_image` saves a picture.
+/// Only memos recorded in Notes come this way, and only those recorded for
+/// a transcript get one (decision 33), so a plain memo stays plain.
 pub(crate) async fn add_memo(
     State(state): State<NotesState>,
     Authenticated(me): Authenticated,
     Path(id): Path<ItemId>,
-    Query(request): Query<NewImage>,
+    Query(request): Query<NewMemo>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<AddedImage>), ApiError> {
     let extension = sound_extension(&request.name)
@@ -710,7 +721,13 @@ pub(crate) async fn add_memo(
             "This memo has no sound in it. Record it again.",
         ));
     }
-    save_beside(&state, &me, id, &extension, &body).await
+    let (status, saved) = save_beside(&state, &me, id, &extension, &body).await?;
+    // Transcripts turned off since the app asked: the memo stays plain.
+    if request.transcribe && state.transcripts.is_on() {
+        let name = saved.path.rsplit('/').next().unwrap_or(&saved.path);
+        state.waiting.ask(saved.id, name, id, me.user.id).await?;
+    }
+    Ok((status, saved))
 }
 
 /// Saves a file beside the note `id`, named after it and numbered, and
@@ -766,6 +783,7 @@ async fn save_beside(
     Ok((
         StatusCode::CREATED,
         Json(AddedImage {
+            id: saved.id,
             line: links::image_line(&path),
             path,
         }),

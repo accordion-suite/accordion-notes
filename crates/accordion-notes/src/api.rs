@@ -27,6 +27,7 @@ use crate::reminders::{Invalid, REMINDERS, ReminderView, When};
 use crate::settings::NotesSettings;
 use crate::shared::Choices;
 use crate::store::{Indexed, shorten};
+use crate::transcripts;
 
 /// How much of each note the list sends, for its card.
 const CARD_CHARS: usize = 1500;
@@ -60,6 +61,11 @@ pub(crate) fn routes(state: NotesState) -> Router {
         .route("/labels", get(labels).post(add_label))
         .route("/labels/{name}", put(rename_label).delete(remove_label))
         .route("/settings", get(get_settings).put(put_settings))
+        .route(
+            "/transcripts",
+            get(transcripts::get_setting).put(transcripts::put_setting),
+        )
+        .route("/transcripts/on", get(transcripts::get_on))
         .with_state(state)
 }
 
@@ -97,6 +103,9 @@ struct NoteView {
     /// in Notes. Empty for others' notes, whose images show through
     /// `/notes/{id}/image` like anyone's.
     images: Vec<ImageView>,
+    /// The names of its voice memos waiting for transcripts, which the
+    /// editor shows as Transcribing….
+    transcribing: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +157,7 @@ impl NoteView {
             access: access_name(access),
             reminder: None,
             images: Vec::new(),
+            transcribing: Vec::new(),
         }
     }
 
@@ -170,6 +180,7 @@ impl NoteView {
             modified_at: indexed.modified_at,
             reminder: None,
             images: Vec::new(),
+            transcribing: Vec::new(),
         }
     }
 }
@@ -355,8 +366,19 @@ async fn own_view(
         shared,
         images,
         reminder: reminder.as_ref().map(ReminderView::from),
+        transcribing: transcribing(state, item.id).await?,
         ..NoteView::new(indexed, file.body().to_owned(), top)
     })
+}
+
+/// The names of a note's memos waiting for transcripts.
+async fn transcribing(state: &NotesState, id: ItemId) -> Result<Vec<String>, ApiError> {
+    Ok(state
+        .waiting
+        .by_note()
+        .await?
+        .remove(&id)
+        .unwrap_or_default())
 }
 
 /// Someone else's note, as the web app shows it.
@@ -378,6 +400,7 @@ async fn others_view(
     let reminder = state.reminders.get(me.user.id, item.id).await?;
     Ok(NoteView {
         reminder: reminder.as_ref().map(ReminderView::from),
+        transcribing: transcribing(state, item.id).await?,
         ..NoteView::others(item, access, &text, body, choices, owner)
     })
 }
@@ -480,8 +503,10 @@ async fn list(
         notes.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     }
     let reminders = state.reminders.of(me.user.id).await?;
+    let mut waiting = state.waiting.by_note().await?;
     for note in &mut notes {
         note.reminder = reminders.get(&note.id).map(ReminderView::from);
+        note.transcribing = waiting.remove(&note.id).unwrap_or_default();
     }
     let folders = all_folders
         .into_iter()

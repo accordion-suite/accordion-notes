@@ -10,6 +10,7 @@ use accordion_core::live::Live;
 use accordion_core::storage::{ItemKind, ShareLevel, Storage};
 use accordion_core::texts::{self, Texts};
 use accordion_core::thumbnails::{Thumbnails, Tools};
+use accordion_core::transcripts::Transcripts;
 use accordion_module::{Module, Services, Stopping};
 use accordion_notes::Notes;
 use accordion_types::{ItemId, Role, UserId};
@@ -79,6 +80,12 @@ async fn start() -> Server {
         events: Events::open(db.clone()).await.unwrap(),
         thumbnails,
         texts,
+        // Every memo says the same, instead of what whisper.cpp hears.
+        transcripts: Transcripts::canned(db.clone(), storage.clone(), dir.path(), |_| {
+            Some("Buy milk and bread.".to_owned())
+        })
+        .await
+        .unwrap(),
         live: Live::new(db, &identity),
         link_origin: watch::channel(None).1,
     };
@@ -87,10 +94,15 @@ async fn start() -> Server {
         .start(services.clone(), Stopping::new(stopping))
         .await
         .unwrap();
+    // Reminders ringing and memos being transcribed.
+    if let Some(background) = started.background {
+        tokio::spawn(background);
+    }
     Server {
         router: Router::new().nest("/api/notes", started.routes.api.unwrap()),
-        alex: person(&identity, "alex").await,
-        sam: person(&identity, "sam").await,
+        // The first account is the server's owner, an admin.
+        alex: person(&identity, "alex", Role::Owner).await,
+        sam: person(&identity, "sam", Role::User).await,
         storage,
         services,
         _dir: dir,
@@ -98,12 +110,12 @@ async fn start() -> Server {
     }
 }
 
-async fn person(identity: &Identity, username: &str) -> Person {
+async fn person(identity: &Identity, username: &str, role: Role) -> Person {
     let user = identity
         .create_user(NewUser {
             username: username.into(),
             display_name: username.into(),
-            role: Role::User,
+            role,
             password: "correct horse".into(),
         })
         .await
@@ -1679,6 +1691,242 @@ async fn a_removed_image_goes_to_the_trash_once_nothing_shows_it() {
             .unwrap()
             .is_none()
     );
+}
+
+/// Saves a voice memo for a note, as the app does after recording, and
+/// returns its path and line. `transcribe` is whether it was recorded for
+/// a transcript.
+async fn add_memo(
+    server: &Server,
+    person: &Person,
+    note: &str,
+    transcribe: bool,
+) -> (String, String) {
+    let (status, _, body) = server
+        .raw(
+            person,
+            "POST",
+            &format!("/notes/{note}/memos?name=Memo.webm&transcribe={transcribe}"),
+            b"\x1a\x45\xdf\xa3 a memo".to_vec(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let added: Value = serde_json::from_slice(&body).unwrap();
+    (
+        added["path"].as_str().unwrap().to_owned(),
+        added["line"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// Waits for a note's file to have `words` in it.
+async fn wait_for_text(server: &Server, id: &str, words: &str) -> String {
+    for _ in 0..100 {
+        let text = server.file_text(id).await;
+        if text.contains(words) {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{words:?} never reached the note: {}",
+        server.file_text(id).await
+    );
+}
+
+#[tokio::test]
+async fn a_memos_transcript_lands_at_the_end_of_its_note() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Shopping", "body": "Eggs"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let (path, line) = add_memo(&server, &server.alex, id, true).await;
+    assert_eq!(path, "Shopping 1.webm");
+
+    // It waits for the app to link the memo, and the editor says so.
+    let (_, opened) = server
+        .api(&server.alex, "GET", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(opened["transcribing"], json!(["Shopping 1.webm"]));
+    // What's typed meanwhile stays, with the words after it.
+    let (status, changed) = server
+        .api(
+            &server.alex,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"base": opened["hash"], "body": format!("{line}\nEggs\nTyped while recording")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    let text = wait_for_text(&server, id, "Buy milk and bread.").await;
+    assert!(
+        text.ends_with(
+            "![](Shopping%201.webm)\nEggs\nTyped while recording\n\nBuy milk and bread.\n"
+        ),
+        "{text}"
+    );
+    let notes = server.list(&server.alex).await;
+    assert_eq!(notes[0]["transcribing"], json!([]));
+    assert!(
+        notes[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Buy milk and bread.")
+    );
+}
+
+#[tokio::test]
+async fn a_memo_removed_before_its_transcript_gets_none() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Shopping", "body": "Eggs"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let (path, _) = add_memo(&server, &server.alex, id, true).await;
+    let memo = server
+        .storage
+        .find(server.notes_folder(&server.alex).await, vec![path.clone()])
+        .await
+        .unwrap()
+        .unwrap();
+    server
+        .as_person(&server.alex)
+        .delete(memo.id)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let (_, opened) = server
+            .api(&server.alex, "GET", &format!("/notes/{id}"), None)
+            .await;
+        if opened["transcribing"] == json!([]) {
+            assert_eq!(opened["body"], "Eggs");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the memo kept waiting");
+}
+
+#[tokio::test]
+async fn memos_get_no_transcripts_while_its_off() {
+    let server = start().await;
+    server.services.transcripts.choose(None).await.unwrap();
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Shopping", "body": "Eggs"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    add_memo(&server, &server.alex, id, true).await;
+    let (_, opened) = server
+        .api(&server.alex, "GET", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(opened["transcribing"], json!([]));
+}
+
+#[tokio::test]
+async fn a_memo_recorded_without_a_transcript_stays_plain() {
+    let server = start().await;
+    let (_, note) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/notes",
+            Some(json!({"title": "Shopping", "body": "Eggs"})),
+        )
+        .await;
+    let id = note["id"].as_str().unwrap();
+    let (_, line) = add_memo(&server, &server.alex, id, false).await;
+    let (_, opened) = server
+        .api(&server.alex, "GET", &format!("/notes/{id}"), None)
+        .await;
+    assert_eq!(opened["transcribing"], json!([]));
+    let (status, changed) = server
+        .api(
+            &server.alex,
+            "PUT",
+            &format!("/notes/{id}"),
+            Some(json!({"base": opened["hash"], "body": format!("{line}\nEggs")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    // Long enough for a transcript, which is canned here, to have landed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let text = server.file_text(id).await;
+    assert!(!text.contains("Buy milk and bread."), "{text}");
+}
+
+#[tokio::test]
+async fn everyone_can_see_whether_transcripts_are_on() {
+    let server = start().await;
+    let (status, on) = server
+        .api(&server.sam, "GET", "/transcripts/on", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    assert_eq!(on, json!({"on": true}));
+    server.services.transcripts.choose(None).await.unwrap();
+    let (_, on) = server
+        .api(&server.sam, "GET", "/transcripts/on", None)
+        .await;
+    assert_eq!(on, json!({"on": false}));
+}
+
+#[tokio::test]
+async fn only_admins_see_and_change_the_transcript_setting() {
+    let server = start().await;
+    let (status, setting) = server.api(&server.alex, "GET", "/transcripts", None).await;
+    assert_eq!(status, StatusCode::OK, "{setting}");
+    assert_eq!(setting["recommended"], "small");
+    assert_eq!(setting["models"][0]["id"], "base");
+    let (status, _) = server.api(&server.sam, "GET", "/transcripts", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "PUT",
+            "/transcripts",
+            Some(json!({"model": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "PUT",
+            "/transcripts",
+            Some(json!({"model": "large-v3-turbo"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, setting) = server
+        .api(
+            &server.alex,
+            "PUT",
+            "/transcripts",
+            Some(json!({"model": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{setting}");
+    assert_eq!(setting["model"], Value::Null);
+    assert_eq!(setting["state"], "off");
 }
 
 #[tokio::test]

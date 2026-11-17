@@ -17,6 +17,7 @@ mod reminders;
 mod settings;
 mod shared;
 mod store;
+mod transcripts;
 
 use accordion_core::coedit::CoEditing;
 use accordion_core::db::Migration;
@@ -24,6 +25,7 @@ use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::Storage;
 use accordion_core::thumbnails::Thumbnails;
+use accordion_core::transcripts::Transcripts;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
 use axum::extract::FromRef;
 
@@ -38,6 +40,7 @@ static MIGRATIONS: &[Migration] = &[
     shared::MIGRATION,
     reminders::MIGRATION,
     store::MIGRATION_6,
+    transcripts::MIGRATION,
 ];
 
 /// The Notes module. Add it to the server's list of modules.
@@ -81,6 +84,8 @@ impl Module for Notes {
                 live: services.live.clone(),
             };
             let state = NotesState {
+                waiting: transcripts::Waiting::new(services.db.clone()),
+                transcripts: services.transcripts,
                 reminders,
                 live: services.live,
                 store: store::Store::new(services.db.clone(), services.storage.clone()),
@@ -91,12 +96,15 @@ impl Module for Notes {
                 identity: services.identity,
                 storage: services.storage,
             };
+            let transcribing = transcripts::run(state.clone(), stopping.clone());
             Ok(Started {
                 routes: Routes {
                     api: Some(api::routes(state)),
                     ..Routes::default()
                 },
-                background: Some(Box::pin(ringer.run(stopping))),
+                background: Some(Box::pin(async move {
+                    tokio::join!(ringer.run(stopping), transcribing);
+                })),
             })
         })
     }
@@ -113,6 +121,10 @@ struct NotesState {
     live: Live,
     coediting: CoEditing,
     thumbnails: Thumbnails,
+    /// Transcribing voice memos, once an admin turns it on (decision 33).
+    transcripts: Transcripts,
+    /// Memos waiting for transcripts.
+    waiting: transcripts::Waiting,
 }
 
 impl FromRef<NotesState> for Identity {
