@@ -276,26 +276,28 @@ pub fn image_line(path: &str) -> String {
     format!("![]({})", encode(path))
 }
 
-/// `text` with every link to `old` pointing at `new` instead, or `None` if
-/// nothing links to `old`.
-pub fn rewrite(text: &str, old: &str, new: &str) -> Option<String> {
-    let found: Vec<Link> = links(text)
-        .into_iter()
-        .filter(|link| link.target == old)
-        .collect();
-    if found.is_empty() {
-        return None;
-    }
+/// `text` with each link pointing where `change` says instead, or `None`
+/// if it changes none. `change` gives a link's new target, or `None` to
+/// leave it.
+pub fn rewrite(text: &str, mut change: impl FnMut(&Link) -> Option<String>) -> Option<String> {
     let mut out = String::with_capacity(text.len() + 16);
     let mut at = 0;
-    for link in found {
+    let mut changed = false;
+    for link in links(text) {
+        let Some(new) = change(&link) else {
+            continue;
+        };
         out.push_str(&text[at..link.start]);
         if link.wiki {
-            out.push_str(new);
+            out.push_str(&new);
         } else {
-            out.push_str(&encode(new));
+            out.push_str(&encode(&new));
         }
         at = link.end;
+        changed = true;
+    }
+    if !changed {
+        return None;
     }
     out.push_str(&text[at..]);
     Some(out)
@@ -348,11 +350,16 @@ mod tests {
     #[test]
     fn rewrites_only_the_moved_file() {
         let text = "![](a%20b.jpg)\n![[a b.jpg]]\n![](c.jpg)\n[a](a%20b.jpg \"t\")\n";
+        let moved = |link: &Link| (link.target == "a b.jpg").then(|| "Garden/a b.jpg".to_owned());
         assert_eq!(
-            rewrite(text, "a b.jpg", "Garden/a b.jpg").unwrap(),
+            rewrite(text, moved).unwrap(),
             "![](Garden/a%20b.jpg)\n![[Garden/a b.jpg]]\n![](c.jpg)\n[a](Garden/a%20b.jpg \"t\")\n"
         );
-        assert_eq!(rewrite(text, "d.jpg", "e.jpg"), None);
+        assert_eq!(
+            rewrite(text, |link| (link.target == "d.jpg")
+                .then(|| "e.jpg".into())),
+            None
+        );
     }
 
     #[test]

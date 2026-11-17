@@ -46,36 +46,93 @@ pub(crate) struct Files {
 
 impl Files {
     pub(crate) async fn of(state: &NotesState, user: UserId) -> Result<Self, Error> {
+        Ok(Self::new(state.store.files(user).await?))
+    }
+
+    pub(crate) fn new(files: Vec<Beside>) -> Self {
         let mut by_path = HashMap::new();
         let mut by_name: HashMap<String, Vec<Beside>> = HashMap::new();
-        for file in state.store.files(user).await? {
+        for file in files {
             let name = file.path.rsplit('/').next().unwrap_or_default().to_owned();
             by_name.entry(name).or_default().push(file.clone());
             by_path.insert(file.path.clone(), file);
         }
-        Ok(Self { by_path, by_name })
+        Self { by_path, by_name }
     }
 
     /// The file a link points to, from a note in the folder at `dir`: its
     /// path from the top of the place, as Notes writes links, then from
     /// the note's folder, then, for a bare name, the one file with it.
     pub(crate) fn resolve(&self, dir: &str, target: &str) -> Option<&Beside> {
+        self.reach(dir, target).map(|(file, _)| file)
+    }
+
+    /// Like `resolve`, with which of the three ways the link reached it.
+    pub(crate) fn reach(&self, dir: &str, target: &str) -> Option<(&Beside, Way)> {
         let target = target.trim_start_matches("./");
         if let Some(file) = self.by_path.get(target) {
-            return Some(file);
+            return Some((file, Way::FromTop));
         }
         if !dir.is_empty()
             && let Some(file) = self.by_path.get(&format!("{dir}/{target}"))
         {
-            return Some(file);
+            return Some((file, Way::FromFolder));
         }
         if !target.contains('/')
             && let Some([only]) = self.by_name.get(target).map(Vec::as_slice)
         {
-            return Some(only);
+            return Some((only, Way::ByName));
         }
         None
     }
+
+    /// How to write `link`, from a note in the folder at `dir`, so it
+    /// reaches the file `id`, now at `path`, after it moved from `old`. The
+    /// link keeps its style where that still reaches the file: a bare name
+    /// in Obsidian's `[[name]]`, or a path from the note's folder. Otherwise
+    /// it becomes the path from the top of the place, as Notes writes links.
+    pub(crate) fn link_to(
+        &self,
+        dir: &str,
+        link: &links::Link,
+        old: &str,
+        id: ItemId,
+        path: &str,
+    ) -> String {
+        let dotted = link.target.starts_with("./");
+        let written = link.target.trim_start_matches("./");
+        let mut tries = Vec::new();
+        if written != old {
+            if link.wiki && !written.contains('/') {
+                tries.push(path.rsplit('/').next().unwrap_or(path).to_owned());
+            }
+            let below = if dir.is_empty() {
+                Some(path)
+            } else {
+                path.strip_prefix(dir)
+                    .and_then(|rest| rest.strip_prefix('/'))
+            };
+            if let Some(below) = below {
+                tries.push(if dotted {
+                    format!("./{below}")
+                } else {
+                    below.to_owned()
+                });
+            }
+        }
+        tries
+            .into_iter()
+            .find(|tried| self.resolve(dir, tried).is_some_and(|file| file.id == id))
+            .unwrap_or_else(|| path.to_owned())
+    }
+}
+
+/// How a link reaches a file, as `Files::reach` reads it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Way {
+    FromTop,
+    FromFolder,
+    ByName,
 }
 
 /// Each folder's path from the top of the Notes place, with the top's
@@ -84,28 +141,7 @@ pub(crate) async fn folder_paths(
     state: &NotesState,
     top: ItemId,
 ) -> Result<HashMap<ItemId, String>, Error> {
-    let folders = state.store.folders(top).await?;
-    let parents: HashMap<ItemId, (Option<ItemId>, String)> = folders
-        .into_iter()
-        .map(|folder| (folder.id, (folder.parent, folder.name)))
-        .collect();
-    let mut paths = HashMap::from([(top, String::new())]);
-    for id in parents.keys() {
-        let mut names = Vec::new();
-        let mut at = Some(*id);
-        while let Some(current) = at {
-            match parents.get(&current) {
-                Some((parent, name)) => {
-                    names.push(name.as_str());
-                    at = *parent;
-                }
-                None => break,
-            }
-        }
-        names.reverse();
-        paths.insert(*id, names.join("/"));
-    }
-    Ok(paths)
+    state.store.folder_paths(top).await
 }
 
 /// The path of the folder `item` is in, from the top of the place.

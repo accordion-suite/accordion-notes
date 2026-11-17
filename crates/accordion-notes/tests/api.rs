@@ -1418,6 +1418,54 @@ async fn images_go_beside_their_note_and_links_follow_them() {
 }
 
 #[tokio::test]
+async fn links_obsidian_writes_follow_their_files_too() {
+    let server = start().await;
+    server.list(&server.alex).await;
+    let top = server.notes_folder(&server.alex).await;
+    let alex = server.as_person(&server.alex);
+    let garden = alex.create_folder(top, "Garden").await.unwrap();
+    let pictures = alex.create_folder(top, "Pictures").await.unwrap();
+    let mut photos = Vec::new();
+    for name in ["a.jpg", "b.jpg", "d.jpg", "e.jpg"] {
+        photos.push(alex.create_file(garden.id, name, PHOTO).await.unwrap().id);
+    }
+    let c = alex.create_file(pictures.id, "c.jpg", PHOTO).await.unwrap();
+    // A bare name, links from the note's folder, one from the top of the
+    // place, and a bare name to a file in another folder.
+    let note = alex
+        .create_file(
+            garden.id,
+            "Trip.md",
+            &b"![[a.jpg]]\n![](b.jpg)\n![](./d.jpg)\n![](Garden/e.jpg)\n![[c.jpg]]\nTent\n"[..],
+        )
+        .await
+        .unwrap();
+    server.list(&server.alex).await;
+
+    let sub = alex.create_folder(garden.id, "Sub").await.unwrap();
+    let old = alex.create_folder(pictures.id, "Old").await.unwrap();
+    alex.move_item(photos[0], garden.id, "a2.jpg")
+        .await
+        .unwrap();
+    alex.move_item(photos[1], sub.id, "b.jpg").await.unwrap();
+    alex.move_item(photos[2], top, "d.jpg").await.unwrap();
+    alex.move_item(photos[3], garden.id, "e2.jpg")
+        .await
+        .unwrap();
+    alex.move_item(c.id, old.id, "c.jpg").await.unwrap();
+    server.list(&server.alex).await;
+
+    // Each keeps its style where that still reaches the file. The bare
+    // name to a file that's still the only one with it stays as it was.
+    assert_eq!(
+        server.file_text(&note.id.to_string()).await,
+        "![[a2.jpg]]\n![](Sub/b.jpg)\n![](d.jpg)\n![](Garden/e2.jpg)\n![[c.jpg]]\nTent\n"
+    );
+    let notes = server.list(&server.alex).await;
+    assert_eq!(notes[0]["images"].as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
 async fn takes_only_pictures() {
     let server = start().await;
     let (_, note) = server

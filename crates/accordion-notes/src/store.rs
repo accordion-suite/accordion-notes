@@ -12,7 +12,7 @@
 //! Notes owns these tables (decision 1), so it names items only by ID and
 //! never joins core's tables.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use accordion_core::db::rusqlite::{self, OptionalExtension, Row};
@@ -22,6 +22,7 @@ use accordion_types::{ItemId, UserId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
+use crate::images::Files;
 use crate::links;
 use crate::note::{self, NoteFile};
 
@@ -126,6 +127,13 @@ pub(crate) struct Beside {
     pub parent: ItemId,
     /// Its path from the top of the Notes place, such as `Garden/a.jpg`.
     pub path: String,
+}
+
+/// A file in a Notes place that moved or was renamed.
+pub(crate) struct Moved {
+    pub id: ItemId,
+    /// Its path from the top of the place before.
+    pub old: String,
 }
 
 /// A link in a note, as the index has it.
@@ -601,13 +609,8 @@ impl Store {
     }
 
     /// Notes where a file in `user`'s Notes place is, such as an image.
-    /// Returns the old path and the new one if it moved or was renamed.
-    async fn track(
-        &self,
-        user: UserId,
-        top: ItemId,
-        item: &Item,
-    ) -> Result<Option<(String, String)>, Error> {
+    /// Returns how it moved, if it moved or was renamed.
+    async fn track(&self, user: UserId, top: ItemId, item: &Item) -> Result<Option<Moved>, Error> {
         let Some(path) = self.storage.path_within(top, item.id).await? else {
             self.untrack(user, item.id).await?;
             return Ok(None);
@@ -638,7 +641,7 @@ impl Store {
                 Ok::<_, Error>(old)
             })
             .await?;
-        Ok(old.filter(|old| *old != path).map(|old| (old, path)))
+        Ok(old.filter(|old| *old != path).map(|old| Moved { id, old }))
     }
 
     /// Forgets a file that's gone. Returns whether Notes knew it.
@@ -654,9 +657,8 @@ impl Store {
     }
 
     /// Lists every file in `user`'s Notes place again, such as after a
-    /// folder moved, and returns the ones whose paths changed, with their
-    /// old paths and new ones.
-    async fn files_again(&self, user: UserId, top: ItemId) -> Result<Vec<(String, String)>, Error> {
+    /// folder moved, and returns the ones whose paths changed.
+    async fn files_again(&self, user: UserId, top: ItemId) -> Result<Vec<Moved>, Error> {
         let mut found = Vec::new();
         let mut waiting = vec![(top, String::new())];
         while let Some((folder, at)) = waiting.pop() {
@@ -693,7 +695,7 @@ impl Store {
                     if let Some(old) = known.remove(&file.id)
                         && old != file.path
                     {
-                        renamed.push((old, file.path.clone()));
+                        renamed.push(Moved { id: file.id, old });
                     }
                     tx.execute(
                         "INSERT INTO notes_files (item_id, user_id, parent_id, path)
@@ -720,65 +722,146 @@ impl Store {
             .await
     }
 
-    /// Points `user`'s links at files' new paths, as a new version of each
-    /// note that had one.
-    async fn repair(
-        &self,
-        user: UserId,
-        top: ItemId,
-        renamed: Vec<(String, String)>,
-    ) -> Result<(), Error> {
-        for (old, new) in renamed {
-            let target = old.clone();
-            let notes: Vec<ItemId> = self
-                .db
-                .read(move |conn| {
-                    let mut statement = conn.prepare(
-                        "SELECT DISTINCT note_id FROM notes_links
-                         WHERE user_id = ?1 AND target = ?2",
-                    )?;
-                    let notes = statement
-                        .query_map((user.as_uuid(), &target), |row| {
-                            Ok(ItemId::from_uuid(row.get(0)?))
-                        })?
-                        .collect::<Result<_, _>>()?;
-                    Ok::<_, Error>(notes)
+    /// Points `user`'s links at files that moved or were renamed, as a new
+    /// version of each note that had one. A link changes if it reached the
+    /// file before, as Notes reads links, and doesn't now: one written from
+    /// the top of the place, from the note's folder, or as a bare name.
+    async fn repair(&self, user: UserId, top: ItemId, moved: Vec<Moved>) -> Result<(), Error> {
+        if moved.is_empty() {
+            return Ok(());
+        }
+        // A file that moved twice since the last look keeps its first old
+        // path, which is what the notes' links were written to.
+        let mut was: HashMap<ItemId, String> = HashMap::new();
+        for change in moved {
+            was.entry(change.id).or_insert(change.old);
+        }
+        let now = self.files(user).await?;
+        let paths: HashMap<ItemId, String> = now
+            .iter()
+            .filter(|file| was.contains_key(&file.id))
+            .map(|file| (file.id, file.path.clone()))
+            .collect();
+        let before = Files::new(
+            now.iter()
+                .map(|file| Beside {
+                    path: was.get(&file.id).unwrap_or(&file.path).clone(),
+                    ..file.clone()
                 })
-                .await?;
-            for id in notes {
-                // Someone may save the note in between, so it's tried again
-                // on their text.
-                for _ in 0..3 {
-                    let Some(item) = self.storage.item(id).await? else {
-                        break;
-                    };
-                    let ItemKind::File { blob, .. } = &item.kind else {
-                        break;
-                    };
-                    if !self.is_note(user, top, &item).await? {
+                .collect(),
+        );
+        let after = Files::new(now);
+        let dirs = self.folder_paths(top).await?;
+        let folders = self.note_folders(user).await?;
+        // How a link to a moved file is written now, or `None` to leave
+        // it. A link that still reaches the file, but another way, changes
+        // too: a bare name that worked from the note's folder still reaches
+        // the file while no other has its name, and Markdown viewers other
+        // than Notes and Obsidian don't read bare names.
+        let respell = |dir: &str, link: &links::Link| {
+            let (file, way) = before.reach(dir, &link.target)?;
+            let (old, path) = (was.get(&file.id)?, paths.get(&file.id)?);
+            if after
+                .reach(dir, &link.target)
+                .is_some_and(|(now, now_way)| now.id == file.id && now_way == way)
+            {
+                return None;
+            }
+            Some(after.link_to(dir, link, old, file.id, path)).filter(|new| *new != link.target)
+        };
+        for (id, written) in self.links(user).await? {
+            let dir = folders
+                .get(&id)
+                .copied()
+                .flatten()
+                .and_then(|folder| dirs.get(&folder))
+                .map_or("", String::as_str);
+            let reaches_moved = written.iter().any(|link| {
+                before
+                    .resolve(dir, &link.target)
+                    .is_some_and(|file| paths.contains_key(&file.id))
+            });
+            if !reaches_moved {
+                continue;
+            }
+            // Someone may save the note in between, so it's tried again
+            // on their text.
+            for _ in 0..3 {
+                let Some(item) = self.storage.item(id).await? else {
+                    break;
+                };
+                let ItemKind::File { blob, .. } = &item.kind else {
+                    break;
+                };
+                if !self.is_note(user, top, &item).await? {
+                    break;
+                }
+                let mut file = NoteFile::parse(&self.read(id).await?);
+                let Some(body) = links::rewrite(file.body(), |link| respell(dir, link)) else {
+                    break;
+                };
+                file.set_body(&body);
+                match self
+                    .storage
+                    .write_version(id, blob.hash, file.text().as_bytes())
+                    .await
+                {
+                    Ok(item) => {
+                        self.add(user, &item).await?;
                         break;
                     }
-                    let mut file = NoteFile::parse(&self.read(id).await?);
-                    let Some(body) = links::rewrite(file.body(), &old, &new) else {
-                        break;
-                    };
-                    file.set_body(&body);
-                    match self
-                        .storage
-                        .write_version(id, blob.hash, file.text().as_bytes())
-                        .await
-                    {
-                        Ok(item) => {
-                            self.add(user, &item).await?;
-                            break;
-                        }
-                        Err(Error::Changed) => continue,
-                        Err(err) => return Err(err),
-                    }
+                    Err(Error::Changed) => continue,
+                    Err(err) => return Err(err),
                 }
             }
         }
         Ok(())
+    }
+
+    /// Each folder's path from the top of the Notes place at `top`, with
+    /// the top's being empty.
+    pub(crate) async fn folder_paths(&self, top: ItemId) -> Result<HashMap<ItemId, String>, Error> {
+        let folders = self.folders(top).await?;
+        let parents: HashMap<ItemId, (Option<ItemId>, String)> = folders
+            .into_iter()
+            .map(|folder| (folder.id, (folder.parent, folder.name)))
+            .collect();
+        let mut paths = HashMap::from([(top, String::new())]);
+        for id in parents.keys() {
+            let mut names = Vec::new();
+            let mut at = Some(*id);
+            while let Some(current) = at {
+                match parents.get(&current) {
+                    Some((parent, name)) => {
+                        names.push(name.as_str());
+                        at = *parent;
+                    }
+                    None => break,
+                }
+            }
+            names.reverse();
+            paths.insert(*id, names.join("/"));
+        }
+        Ok(paths)
+    }
+
+    /// The folder each of `user`'s notes is in.
+    async fn note_folders(&self, user: UserId) -> Result<HashMap<ItemId, Option<ItemId>>, Error> {
+        self.db
+            .read(move |conn| {
+                let mut statement =
+                    conn.prepare("SELECT item_id, folder_id FROM notes_index WHERE user_id = ?1")?;
+                let folders = statement
+                    .query_map([user.as_uuid()], |row| {
+                        Ok((
+                            ItemId::from_uuid(row.get(0)?),
+                            row.get::<_, Option<_>>(1)?.map(ItemId::from_uuid),
+                        ))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                Ok(folders)
+            })
+            .await
     }
 
     /// Every file in `user`'s Notes place that isn't a note.
