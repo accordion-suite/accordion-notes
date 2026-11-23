@@ -162,8 +162,7 @@ impl When {
     /// twice comes the first time.
     fn moment(&self, local: DateTime) -> Option<Timestamp> {
         let zone = TimeZone::get(&self.zone).ok()?;
-        let zoned = zone.to_ambiguous_zoned(local).compatible().ok()?;
-        Some(zoned.timestamp())
+        zone.to_ambiguous_timestamp(local).compatible().ok()
     }
 
     /// When it next rings after `after`: its time if it doesn't repeat,
