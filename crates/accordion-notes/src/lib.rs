@@ -11,6 +11,8 @@
 mod api;
 mod format;
 mod images;
+mod importer;
+pub mod keep;
 mod links;
 pub mod note;
 mod reminders;
@@ -24,6 +26,7 @@ use accordion_core::db::Migration;
 use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::Storage;
+use accordion_core::takeout::Product;
 use accordion_core::thumbnails::Thumbnails;
 use accordion_core::transcripts::Transcripts;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
@@ -42,6 +45,10 @@ static MIGRATIONS: &[Migration] = &[
     store::MIGRATION_6,
     transcripts::MIGRATION,
 ];
+
+/// What Notes brings from Google Takeout (decision 34): Keep's notes. The
+/// server's program answers the sandbox's `takeout-read` with these.
+pub static TAKEOUT_PRODUCTS: [&dyn Product; 1] = [&keep::Keep];
 
 /// The Notes module. Add it to the server's list of modules.
 pub struct Notes;
@@ -66,6 +73,10 @@ impl Module for Notes {
     fn data_size(&self, services: &Services) -> BoxFuture<Option<u64>> {
         let store = store::Store::new(services.db.clone(), services.storage.clone());
         Box::pin(async move { Some(store.size().await.unwrap_or(0)) })
+    }
+
+    fn takeout_products(&self) -> &'static [&'static dyn Product] {
+        &TAKEOUT_PRODUCTS
     }
 
     fn start(
@@ -97,6 +108,13 @@ impl Module for Notes {
                 storage: services.storage,
             };
             let transcribing = transcripts::run(state.clone(), stopping.clone());
+            // Keep's notes from Takeout, while Notes is on.
+            let importing =
+                services
+                    .takeout
+                    .add_importer(std::sync::Arc::new(importer::KeepImporter::new(
+                        state.clone(),
+                    )));
             Ok(Started {
                 routes: Routes {
                     api: Some(api::routes(state)),
@@ -104,6 +122,7 @@ impl Module for Notes {
                 },
                 background: Some(Box::pin(async move {
                     tokio::join!(ringer.run(stopping), transcribing);
+                    drop(importing);
                 })),
             })
         })

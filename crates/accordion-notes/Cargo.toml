@@ -6,9 +6,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "accordion-notes-sandbox"
+path = "src/bin/sandbox.rs"
+test = false
+
 [dependencies]
 accordion-core = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
 accordion-module = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
+accordion-sandbox = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
 accordion-types = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
 axum = { version = "0.8.9", features = ["ws"] }
 # Time zones for reminders. The bundled list is used where the system has
@@ -27,3 +33,4 @@ tempfile = "3.27.0"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.30.0"
 tower = { version = "0.5.3", features = ["util"] }
+zip = { version = "9.2.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

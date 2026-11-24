@@ -8,6 +8,7 @@ use accordion_core::events::{Actor, Events, Via};
 use accordion_core::identity::{AuthMethod, Client, Identity, NewUser};
 use accordion_core::live::Live;
 use accordion_core::storage::{ItemKind, ShareLevel, Storage};
+use accordion_core::takeout::{self, Imports, Takeout};
 use accordion_core::texts::{self, Texts};
 use accordion_core::thumbnails::{Thumbnails, Tools};
 use accordion_core::transcripts::Transcripts;
@@ -70,6 +71,17 @@ async fn start() -> Server {
     )
     .await
     .unwrap();
+    let events = Events::open(db.clone()).await.unwrap();
+    // Notes' Keep importer is tested in `keep.rs`, with a sandbox to read
+    // archives.
+    let takeout = Imports::open(
+        db.clone(),
+        storage.clone(),
+        events.clone(),
+        Takeout::new(takeout::Tools::installed("/nonexistent"), dir.path()),
+    )
+    .await
+    .unwrap();
     let services = Services {
         db: db.clone(),
         coediting: CoEditing::open(db.clone(), storage.clone(), identity.clone(), QUICK)
@@ -77,7 +89,7 @@ async fn start() -> Server {
             .unwrap(),
         identity: identity.clone(),
         storage: storage.clone(),
-        events: Events::open(db.clone()).await.unwrap(),
+        events,
         thumbnails,
         texts,
         // Every memo says the same, instead of what whisper.cpp hears.
@@ -88,6 +100,7 @@ async fn start() -> Server {
         .unwrap(),
         live: Live::new(db, &identity),
         link_origin: watch::channel(None).1,
+        takeout,
     };
     let (stop, stopping) = watch::channel(false);
     let started = Notes
