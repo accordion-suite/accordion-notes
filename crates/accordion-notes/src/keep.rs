@@ -369,6 +369,7 @@ struct Run {
     text: String,
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 /// A line of the note: a heading's level, or 0, and its runs.
@@ -383,12 +384,13 @@ struct Line {
 struct Style {
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 /// Reads Keep's HTML into lines of styled text. Keep writes each line as
 /// `<p>` or `<h1>`/`<h2>` with `<span style>` runs, and its formatting is
-/// in the style: `font-weight:700` and `font-style:italic`. Underline has
-/// no Markdown, so it's left out. This reads only those few shapes, and
+/// in the style: `font-weight:700`, `font-style:italic`, and
+/// `text-decoration:underline`. This reads only those few shapes, and
 /// anything else as plain text.
 fn read_html(html: &str) -> Vec<Line> {
     let mut lines = Vec::new();
@@ -402,6 +404,7 @@ fn read_html(html: &str) -> Vec<Line> {
             Style {
                 bold: false,
                 italic: false,
+                underline: false,
             },
             |(_, style)| *style,
         )
@@ -467,7 +470,14 @@ fn read_html(html: &str) -> Vec<Line> {
                     ..current
                 },
             )),
-            "span" | "font" | "u" | "a" | "s" | "sup" | "sub" | "code" => {
+            "u" => styles.push((
+                name,
+                Style {
+                    underline: true,
+                    ..current
+                },
+            )),
+            "span" | "font" | "a" | "s" | "sup" | "sub" | "code" => {
                 let mut style = current;
                 if let Some(css) = attribute(attributes, "style") {
                     if let Some(weight) = css_value(&css, "font-weight") {
@@ -478,6 +488,11 @@ fn read_html(html: &str) -> Vec<Line> {
                     }
                     if let Some(font_style) = css_value(&css, "font-style") {
                         style.italic = font_style == "italic" || font_style == "oblique";
+                    }
+                    let decoration = css_value(&css, "text-decoration-line")
+                        .or_else(|| css_value(&css, "text-decoration"));
+                    if let Some(decoration) = decoration {
+                        style.underline = decoration.contains("underline");
                     }
                 }
                 styles.push((name, style));
@@ -519,13 +534,18 @@ fn add_text(line: &mut Line, lines: &mut Vec<Line>, text: &str, style: Style) {
             continue;
         }
         match line.runs.last_mut() {
-            Some(run) if run.bold == style.bold && run.italic == style.italic => {
+            Some(run)
+                if run.bold == style.bold
+                    && run.italic == style.italic
+                    && run.underline == style.underline =>
+            {
                 run.text.push_str(part);
             }
             _ => line.runs.push(Run {
                 text: part.to_owned(),
                 bold: style.bold,
                 italic: style.italic,
+                underline: style.underline,
             }),
         }
     }
@@ -681,7 +701,7 @@ fn same_text(a: &str, b: &str) -> bool {
     normal(a) == normal(b)
 }
 
-/// The lines as Markdown: headings, and bold and italic runs.
+/// The lines as Markdown: headings, and bold, italic, and underlined runs.
 fn markdown(lines: &[Line]) -> String {
     let mut out = Vec::new();
     for line in lines {
@@ -699,17 +719,26 @@ fn markdown(lines: &[Line]) -> String {
                 (false, false) => "",
             };
             let core = escaped.trim();
-            if marks.is_empty() || core.is_empty() {
+            if (marks.is_empty() && !run.underline) || core.is_empty() {
                 text.push_str(&escaped);
                 continue;
             }
             // Markdown's marks can't have spaces just inside them.
+            // Underline has no Markdown of its own, so it's HTML's `<u>`,
+            // as Notes and Obsidian show it.
             let leading = &escaped[..escaped.len() - escaped.trim_start().len()];
             let trailing = &escaped[escaped.trim_end().len()..];
+            let (open, close) = if run.underline {
+                ("<u>", "</u>")
+            } else {
+                ("", "")
+            };
             text.push_str(leading);
+            text.push_str(open);
             text.push_str(marks);
             text.push_str(core);
             text.push_str(marks);
+            text.push_str(close);
             text.push_str(trailing);
         }
         let text = text.trim_end().to_owned();
@@ -769,7 +798,8 @@ fn escape_text(text: &str, at_line_start: bool) -> String {
     escape_inline(text)
 }
 
-/// `*`, `_`, `` ` ``, `\`, and `~~` escaped, except inside web addresses.
+/// `*`, `_`, `` ` ``, `\`, `~~`, and `<u>` escaped, except inside web
+/// addresses.
 fn escape_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for (index, word) in text.split(' ').enumerate() {
@@ -787,6 +817,7 @@ fn escape_inline(text: &str) -> String {
                 && chars.get(at + 1).is_some_and(|next| next.is_alphanumeric());
             match c {
                 '\\' | '*' | '`' => out.push('\\'),
+                '<' if underline_tag(&chars[at..]) => out.push('\\'),
                 '_' if !between_letters => out.push('\\'),
                 '~' if chars.get(at + 1) == Some(&'~') || (at > 0 && chars[at - 1] == '~') => {
                     out.push('\\')
@@ -797,6 +828,16 @@ fn escape_inline(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `chars` start with `<u>` or `</u>`, which would underline.
+fn underline_tag(chars: &[char]) -> bool {
+    let start: String = chars
+        .iter()
+        .take(4)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    start.starts_with("<u>") || start.starts_with("</u>")
 }
 
 /// `text` on one line.
@@ -856,9 +897,11 @@ mod tests {
                     Tom & Jerry's \"show\"";
         assert_eq!(
             text_body(text, Some(&html)),
-            "Plain\n# Heading one\n## Heading two\n**Bold**\n*Italic*\nUnderlined\n\
-             ***All three***\nTom & Jerry's \"show\""
+            "Plain\n# Heading one\n## Heading two\n**Bold**\n*Italic*\n<u>Underlined</u>\n\
+             <u>***All three***</u>\nTom & Jerry's \"show\""
         );
+        // Text that reads as an underline tag stays text.
+        assert_eq!(escape_line("a <u>b</u> <i>"), "a \\<u>b\\</u> <i>");
     }
 
     #[test]

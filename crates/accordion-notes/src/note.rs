@@ -510,7 +510,7 @@ fn only_shows_a_file(line: &str) -> bool {
 }
 
 /// A line without Markdown's list, checkbox, heading, and quote markers,
-/// or the marks around bold, italic, and code.
+/// or the marks around bold, italic, underline, and code.
 fn strip_markers(line: &str) -> String {
     let mut line = line;
     loop {
@@ -534,7 +534,11 @@ fn strip_markers(line: &str) -> String {
             break;
         }
     }
-    line.replace(['*', '_', '`'], "").trim().to_owned()
+    line.replace(['*', '_', '`'], "")
+        .replace("<u>", "")
+        .replace("</u>", "")
+        .trim()
+        .to_owned()
 }
 
 /// Text that can be part of a file's name on every computer the note syncs
