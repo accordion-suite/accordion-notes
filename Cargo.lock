@@ -5,12 +5,13 @@ version = 4
 [[package]]
 name = "accordion-core"
 version = "0.1.0"
-source = "git+https://github.com/accordion-suite/accordion-core#7a3d02f49bf329faabaefb198ca7c63032d71849"
+source = "git+https://github.com/accordion-suite/accordion-core#14156d56a2ffd158774d2ad4da145f04bfc43be3"
 dependencies = [
  "accordion-sandbox",
  "accordion-types",
  "argon2",
  "base64ct",
+ "flate2",
  "getrandom 0.4.3",
  "html5ever",
  "jiff",
@@ -21,6 +22,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -35,7 +37,7 @@ dependencies = [
 [[package]]
 name = "accordion-module"
 version = "0.1.0"
-source = "git+https://github.com/accordion-suite/accordion-core#7a3d02f49bf329faabaefb198ca7c63032d71849"
+source = "git+https://github.com/accordion-suite/accordion-core#14156d56a2ffd158774d2ad4da145f04bfc43be3"
 dependencies = [
  "accordion-core",
  "accordion-types",
@@ -52,6 +54,7 @@ version = "0.1.0"
 dependencies = [
  "accordion-core",
  "accordion-module",
+ "accordion-sandbox",
  "accordion-types",
  "axum",
  "futures-util",
@@ -65,12 +68,13 @@ dependencies = [
  "tower",
  "tracing",
  "yrs",
+ "zip",
 ]
 
 [[package]]
 name = "accordion-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/accordion-suite/accordion-core#7a3d02f49bf329faabaefb198ca7c63032d71849"
+source = "git+https://github.com/accordion-suite/accordion-core#14156d56a2ffd158774d2ad4da145f04bfc43be3"
 dependencies = [
  "landlock",
  "libc",
@@ -83,7 +87,7 @@ dependencies = [
 [[package]]
 name = "accordion-types"
 version = "0.1.0"
-source = "git+https://github.com/accordion-suite/accordion-core#7a3d02f49bf329faabaefb198ca7c63032d71849"
+source = "git+https://github.com/accordion-suite/accordion-core#14156d56a2ffd158774d2ad4da145f04bfc43be3"
 dependencies = [
  "serde",
  "uuid",
@@ -492,6 +496,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 dependencies = [
  "getrandom 0.4.3",
+]
+
+[[package]]
+name = "filetime"
+version = "0.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
+dependencies = [
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -1492,6 +1506,16 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
 
 [[package]]
 name = "tempfile"
