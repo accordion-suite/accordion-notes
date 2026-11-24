@@ -139,6 +139,14 @@ impl KeepImporter {
                 media.push(saved);
             }
         }
+        // Keep's whole list of labels, so ones no note has come over too.
+        for label in &note.all_labels {
+            self.state
+                .store
+                .keep_label(person, label.clone(), true)
+                .await
+                .map_err(ItemError::from)?;
+        }
         for missing in &note.missing {
             importing.report(MISSING, format!("{label}: {}", escape(missing)));
         }
@@ -322,8 +330,18 @@ fn checked(mut note: KeepNote) -> KeepNote {
     note.color = note
         .color
         .filter(|color| note::COLORS.contains(&color.as_str()));
-    let mut labels = Vec::new();
-    for label in note.labels.iter().take(keep::MAX_LIST) {
+    note.labels = clean_labels(&note.labels, keep::MAX_LIST);
+    note.all_labels = clean_labels(&note.all_labels, keep::MAX_LABELS);
+    note.sharees.truncate(keep::MAX_LIST);
+    note.missing.truncate(keep::MAX_LIST);
+    note
+}
+
+/// Labels as Notes takes them: no `#`, on one line, at most
+/// [`LABEL_CHARS`] long, without blanks or repeats.
+fn clean_labels(labels: &[String], most: usize) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for label in labels.iter().take(most) {
         let label: String = label
             .trim()
             .trim_start_matches('#')
@@ -332,14 +350,11 @@ fn checked(mut note: KeepNote) -> KeepNote {
             .take(LABEL_CHARS)
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
-        if !label.is_empty() && !labels.contains(&label) {
-            labels.push(label);
+        if !label.is_empty() && !cleaned.contains(&label) {
+            cleaned.push(label);
         }
     }
-    note.labels = labels;
-    note.sharees.truncate(keep::MAX_LIST);
-    note.missing.truncate(keep::MAX_LIST);
-    note
+    cleaned
 }
 
 /// A time in microseconds since 1970.

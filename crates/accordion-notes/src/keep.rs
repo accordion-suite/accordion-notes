@@ -29,6 +29,11 @@ pub const MAX_LIST: usize = 100;
 const MAX_ITEMS: usize = 10_000;
 /// How much of the title goes into an item's key.
 const KEY_TITLE: usize = 500;
+/// Keep's list of the person's labels, one a line, including labels no
+/// note has.
+const LABELS: &str = "Labels.txt";
+/// How many labels the list may have.
+pub const MAX_LABELS: usize = 1000;
 
 /// Keep, for the reader's list of products.
 pub struct Keep;
@@ -54,6 +59,10 @@ pub struct KeepNote {
     pub sharees: Vec<Sharee>,
     /// Attachments the note names that aren't in the archives.
     pub missing: Vec<String>,
+    /// Keep's whole list of labels, on the export's first note only, so
+    /// labels no note has come over too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +86,7 @@ impl Product for Keep {
     }
 
     fn wants(&self, path: &str) -> bool {
-        !path.contains('/') && path.ends_with(".json")
+        !path.contains('/') && (path.ends_with(".json") || path == LABELS)
     }
 
     fn plan(&self, folder: &ProductFolder) -> Option<Vec<Planned>> {
@@ -90,8 +99,14 @@ impl Product for Keep {
         let mut planned = Vec::new();
         let mut notes = 0;
         let mut others = 0;
+        let mut all_labels = Vec::new();
+        let mut first_note = None;
         for entry in folder.entries {
             if entry.folder || !self.wants(&entry.path) {
+                continue;
+            }
+            if entry.path == LABELS {
+                all_labels = folder.read(entry).map(labels_list).unwrap_or_default();
                 continue;
             }
             let bytes = folder.read(entry);
@@ -106,7 +121,14 @@ impl Product for Keep {
                 continue;
             };
             notes += 1;
+            first_note.get_or_insert(planned.len());
             planned.push(plan_note(entry, &json, &by_name));
+        }
+        if let Some(first) = first_note
+            && !all_labels.is_empty()
+        {
+            let fields = &mut planned[first].fields;
+            fields["all_labels"] = Value::from(all_labels);
         }
         // Drive's folder has an `-info.json` for nearly every file, so it
         // never looks like Keep's, even with notes kept in it.
@@ -219,7 +241,23 @@ fn convert(json: &Value) -> KeepNote {
             .take(MAX_LIST)
             .collect(),
         missing: Vec::new(),
+        all_labels: Vec::new(),
     }
+}
+
+/// The labels in Keep's `Labels.txt`, one a line, in its order.
+fn labels_list(bytes: &[u8]) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let label = cut(line.trim().trim_start_matches('\u{feff}'), 200);
+        if !label.is_empty() && !labels.contains(&label) {
+            labels.push(label);
+        }
+        if labels.len() == MAX_LABELS {
+            break;
+        }
+    }
+    labels
 }
 
 /// The objects in the list `key` of `json`, none if it isn't one.
@@ -948,7 +986,16 @@ mod tests {
                     owner: true
                 }],
                 missing: vec![],
+                all_labels: vec![],
             }
+        );
+    }
+
+    #[test]
+    fn reads_keeps_list_of_labels() {
+        assert_eq!(
+            labels_list("\u{feff}Home\r\nÀ faire\n\nHome\n  Work  \n".as_bytes()),
+            ["Home", "À faire", "Work"]
         );
     }
 

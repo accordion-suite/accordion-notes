@@ -305,7 +305,8 @@ fn notes_part() -> Vec<(String, Vec<u8>)> {
             ),
         ),
         keep("Broken.json", b"{ not a note".to_vec()),
-        keep("Labels.txt", b"Home\n".to_vec()),
+        // Keep's list of labels: one on a note, one on none.
+        keep("Labels.txt", b"Home\nSomeday\n".to_vec()),
     ]
 }
 
@@ -454,6 +455,17 @@ async fn imports_keeps_notes_into_notes() {
     ];
     expected.sort();
     assert_eq!(server.names().await, expected);
+
+    // Labels no note has come over too.
+    let labels = server.get("/labels").await;
+    let labels: Vec<&str> = labels["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|label| label.as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"Someday"), "{labels:?}");
+    assert!(labels.contains(&"Home"), "{labels:?}");
 
     let list = server.get("/notes").await;
     let notes = list["notes"].as_array().unwrap();
