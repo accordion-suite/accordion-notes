@@ -44,6 +44,7 @@ static MIGRATIONS: &[Migration] = &[
     reminders::MIGRATION,
     store::MIGRATION_6,
     transcripts::MIGRATION,
+    settings::MIGRATION_8,
 ];
 
 /// What Notes brings from Google Takeout (decision 34): Keep's notes. The

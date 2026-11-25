@@ -768,13 +768,13 @@ async fn reports_the_size_of_everyones_notes() {
 }
 
 #[tokio::test]
-async fn keeps_each_persons_list_settings() {
+async fn keeps_each_persons_settings() {
     let server = start().await;
     let (status, body) = server.api(&server.alex, "GET", "/settings", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
-        json!({"new_items": "bottom", "checked_at_bottom": true})
+        json!({"start_in": "text", "new_items": "bottom", "checked_at_bottom": true})
     );
 
     let (status, _) = server
@@ -782,32 +782,48 @@ async fn keeps_each_persons_list_settings() {
             &server.alex,
             "PUT",
             "/settings",
-            Some(json!({"new_items": "top", "checked_at_bottom": false})),
+            Some(json!({"start_in": "title", "new_items": "top", "checked_at_bottom": false})),
         )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, body) = server.api(&server.alex, "GET", "/settings", None).await;
     assert_eq!(
         body,
-        json!({"new_items": "top", "checked_at_bottom": false})
+        json!({"start_in": "title", "new_items": "top", "checked_at_bottom": false})
+    );
+
+    // A web app from before the setting leaves it as it was.
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "PUT",
+            "/settings",
+            Some(json!({"new_items": "bottom", "checked_at_bottom": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = server.api(&server.alex, "GET", "/settings", None).await;
+    assert_eq!(
+        body,
+        json!({"start_in": "title", "new_items": "bottom", "checked_at_bottom": false})
     );
 
     // Sam's stay as they were.
     let (_, body) = server.api(&server.sam, "GET", "/settings", None).await;
     assert_eq!(
         body,
-        json!({"new_items": "bottom", "checked_at_bottom": true})
+        json!({"start_in": "text", "new_items": "bottom", "checked_at_bottom": true})
     );
 
-    let (status, _) = server
-        .api(
-            &server.alex,
-            "PUT",
-            "/settings",
-            Some(json!({"new_items": "middle", "checked_at_bottom": true})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    for wrong in [
+        json!({"new_items": "middle", "checked_at_bottom": true}),
+        json!({"start_in": "label", "new_items": "top", "checked_at_bottom": true}),
+    ] {
+        let (status, _) = server
+            .api(&server.alex, "PUT", "/settings", Some(wrong))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
 
 /// Shares `id` from Alex with Sam.
