@@ -119,7 +119,8 @@ fn access_name(access: Access) -> &'static str {
     match access {
         Access::Owner => "owner",
         Access::Editor => "editor",
-        Access::Viewer => "viewer",
+        // Notes have no comments, so a commenter only views them.
+        Access::Commenter | Access::Viewer => "viewer",
     }
 }
 
@@ -660,7 +661,7 @@ async fn update(
             }
             let item = if change.title.is_some() || change.body.is_some() || change.color.is_some()
             {
-                if access == Access::Viewer {
+                if access < Access::Editor {
                     return Err(ApiError::new(
                         StatusCode::FORBIDDEN,
                         "You can see this note, but not change it. Ask its owner to make you an editor.",

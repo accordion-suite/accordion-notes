@@ -649,7 +649,7 @@ pub(crate) struct AddedImage {
 
 /// Only an editor or the owner changes a note.
 fn may_edit(access: Access) -> Result<(), ApiError> {
-    if access == Access::Viewer {
+    if access < Access::Editor {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "You can see this note, but not change it. Ask its owner to make you an editor.",
